@@ -1,13 +1,5 @@
 {
   "version": 2,
-  "builds": [
-    {"src": "api/process.py", "use": "@vercel/python"},
-    {"src": "api/cron/keep_alive.py", "use": "@vercel/python"},
-    {"src": "api/auth/login.py", "use": "@vercel/python"},
-    {"src": "api/admin/users.py", "use": "@vercel/python"},
-    {"src": "api/admin/split_pdf.py", "use": "@vercel/python"},
-    {"src": "api/dim/search_redact.py", "use": "@vercel/python"}
-  ],
   "routes": [
     {"src": "/api/process", "dest": "/api/process.py"},
     {"src": "/api/cron/keep-alive", "dest": "/api/cron/keep_alive.py"},

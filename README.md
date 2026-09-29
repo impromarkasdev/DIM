@@ -11,7 +11,7 @@ Endpoint: `POST /api/process`. It receives one or more Wix references, downloads
 }
 ```
 
-The endpoint also accepts a raw array such as `["REF-001", "REF-002"]`. `datosSensibles` is optional; configured standard terms are always included. Set `X-Webhook-Secret` when `WEBHOOK_SECRET` is configured.
+The endpoint also accepts a raw array such as `["REF-001", "REF-002"]`. `datosSensibles` is optional; configured stanard terms are always included. Set `X-Webhook-Secret` when `WEBHOOK_SECRET` is configured.
 
 The workbook is searched in descending order from the current year through `EXCEL_FIRST_YEAR` (for example `2026`, `2025`, …, `2021`). This means that when the calendar reaches 2027, worksheet `2027` is searched automatically. Lookup uses zero-based configured column indices; the defaults reproduce a VLOOKUP range where the reference is column 1 and the PDF/location are columns 3 and 4.
 

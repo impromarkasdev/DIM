@@ -1,16 +1,16 @@
 {
   "version": 2,
   "routes": [
-    {"src": "/api/process", "dest": "/api/process.py"},
-    {"src": "/api/cron/keep-alive", "dest": "/api/cron/keep_alive.py"},
-    {"src": "/api/auth/login", "dest": "/api/auth/login.py"},
-    {"src": "/api/admin/users", "dest": "/api/admin/users.py"},
-    {"src": "/api/admin/split-pdf", "dest": "/api/admin/split_pdf.py"},
-    {"src": "/api/dim/search-and-redact", "dest": "/api/dim/search_redact.py"},
-    {"src": "/api/documents/process-redact", "dest": "/api/dim/search_redact.py"}
+    {"src": "/api/process", "dest": "/api/index.py?endpoint=process"},
+    {"src": "/api/cron/keep-alive", "dest": "/api/index.py?endpoint=keep-alive"},
+    {"src": "/api/auth/login", "dest": "/api/index.py?endpoint=login"},
+    {"src": "/api/admin/users", "dest": "/api/index.py?endpoint=users"},
+    {"src": "/api/admin/split-pdf", "dest": "/api/index.py?endpoint=split-pdf"},
+    {"src": "/api/dim/search-and-redact", "dest": "/api/index.py?endpoint=search-redact"},
+    {"src": "/api/documents/process-redact", "dest": "/api/index.py?endpoint=search-redact"}
   ],
   "functions": {
-    "api/admin/split_pdf.py": {
+    "api/index.py": {
       "maxDuration": 60
     }
   },

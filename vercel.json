@@ -1,20 +1,14 @@
 {
   "version": 2,
-  "routes": [
-    {"src": "/api/process", "dest": "/api/index.py?endpoint=process"},
-    {"src": "/api/cron/keep-alive", "dest": "/api/index.py?endpoint=keep-alive"},
-    {"src": "/api/auth/login", "dest": "/api/index.py?endpoint=login"},
-    {"src": "/api/admin/users", "dest": "/api/index.py?endpoint=users"},
-    {"src": "/api/admin/split-pdf", "dest": "/api/index.py?endpoint=split-pdf"},
-    {"src": "/api/dim/search-and-redact", "dest": "/api/index.py?endpoint=search-redact"},
-    {"src": "/api/documents/process-redact", "dest": "/api/index.py?endpoint=search-redact"}
-  ],
   "functions": {
-    "api/index.py": {
+    "api/**/*.py": {
       "maxDuration": 60
     }
   },
   "crons": [
-    {"path": "/api/cron/keep-alive", "schedule": "0 0 * * 1"}
+    {
+      "path": "/api/cron/keep_alive",
+      "schedule": "0 0 * * 1"
+    }
   ]
 }

@@ -14,7 +14,8 @@
     {"src": "/api/auth/login", "dest": "/api/auth/login.py"},
     {"src": "/api/admin/users", "dest": "/api/admin/users.py"},
     {"src": "/api/admin/split-pdf", "dest": "/api/admin/split_pdf.py"},
-    {"src": "/api/dim/search-and-redact", "dest": "/api/dim/search_redact.py"}
+    {"src": "/api/dim/search-and-redact", "dest": "/api/dim/search_redact.py"},
+    {"src": "/api/documents/process-redact", "dest": "/api/dim/search_redact.py"}
   ],
   "crons": [
     {"path": "/api/cron/keep-alive", "schedule": "0 0 * * 1"}

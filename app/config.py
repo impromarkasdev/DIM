@@ -10,8 +10,10 @@ class Settings:
     client_id: str
     client_secret: str
     refresh_token: str
+    auth_mode: str
     azure_scopes: str
     drive_id: str
+    graph_user_id: str
     excel_path: str
     lookup_column_index: int
     pdf_column_index: int
@@ -26,11 +28,17 @@ class Settings:
     def from_env(cls) -> "Settings":
         names = {
             "tenant_id": "AZURE_TENANT_ID", "client_id": "AZURE_CLIENT_ID",
-            "client_secret": "AZURE_CLIENT_SECRET", "refresh_token": "AZURE_REFRESH_TOKEN",
+            "client_secret": "AZURE_CLIENT_SECRET",
             "excel_path": "EXCEL_PATH",
         }
         values = {field: os.getenv(env_name, "").strip() for field, env_name in names.items()}
-        missing = [env_name for field, env_name in names.items() if not values[field]]
+        values["auth_mode"] = os.getenv("AZURE_AUTH_MODE", "client_credentials").strip()
+        if values["auth_mode"] not in {"client_credentials", "refresh_token"}:
+            raise RuntimeError("AZURE_AUTH_MODE must be client_credentials or refresh_token")
+        values["refresh_token"] = os.getenv("AZURE_REFRESH_TOKEN", "").strip()
+        required = names.copy()
+        if values["auth_mode"] == "refresh_token": required["refresh_token"] = "AZURE_REFRESH_TOKEN"
+        missing = [env_name for field, env_name in required.items() if not values[field]]
         if missing:
             raise RuntimeError("Missing required environment variables: " + ", ".join(missing))
         try:
@@ -48,6 +56,9 @@ class Settings:
         terms = tuple(term.strip() for term in os.getenv("STANDARD_SENSITIVE_TERMS", "").split(",") if term.strip())
         # Omit GRAPH_DRIVE_ID for the delegated user's personal OneDrive.
         values["drive_id"] = os.getenv("GRAPH_DRIVE_ID", "").strip()
+        values["graph_user_id"] = os.getenv("GRAPH_USER_ID", "").strip()
+        if values["auth_mode"] == "client_credentials" and not (values["drive_id"] or values["graph_user_id"]):
+            raise RuntimeError("Set GRAPH_DRIVE_ID or GRAPH_USER_ID for client_credentials")
         values["azure_scopes"] = os.getenv(
             "AZURE_SCOPES", "offline_access User.Read Files.ReadWrite"
         ).strip()

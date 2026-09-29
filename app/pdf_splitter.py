@@ -50,3 +50,22 @@ def split_declarations(pdf_bytes: bytes) -> list[tuple[str, bytes]]:
         result.append((f"{form_number}.pdf", output.getvalue()))
     source.close()
     return result
+
+
+def split_pages(pdf_bytes: bytes, original_name: str) -> list[tuple[str, bytes]]:
+    """Create one sanitized PDF per nonblank page for the OneDrive split endpoint."""
+    try:
+        source = fitz.open(stream=pdf_bytes, filetype="pdf")
+    except fitz.FileDataError as exc:
+        raise ValueError("The OneDrive item is not a readable PDF") from exc
+    stem = original_name.rsplit(".", 1)[0]
+    result: list[tuple[str, bytes]] = []
+    for page_number, page in enumerate(source, start=1):
+        if _is_blank(page):
+            continue
+        document = fitz.open(); document.insert_pdf(source, from_page=page_number - 1, to_page=page_number - 1); document.set_metadata({})
+        output = io.BytesIO(); document.save(output, garbage=4, deflate=True, clean=True); document.close()
+        result.append((f"{stem}_pagina_{page_number:03d}.pdf", output.getvalue()))
+    source.close()
+    if not result: raise ValueError("The PDF contains only blank pages")
+    return result

@@ -24,15 +24,14 @@ class handler(ApiHandler):
             graph = GraphClient(Settings.from_env())
             uploaded = []
             import base64
-            for item in successful:
-                filename = f"redactada_{item['nombre_pdf']}"
-                metadata = graph.upload_pdf(f"Procesados/{filename}", base64.b64decode(item["pdf_base64"]))
+            files = [(f"redactada_{item['nombre_pdf']}", base64.b64decode(item["pdf_base64"])) for item in successful]
+            metadata_list = graph.upload_many_pdfs("Procesados", files)
+            for (filename, _), metadata in zip(files, metadata_list):
                 uploaded.append({"fileName": filename, "downloadUrl": metadata.get("@microsoft.graph.downloadUrl", "")})
             self.respond(200, {"success": True, "downloadUrl": uploaded[0]["downloadUrl"], "fileName": uploaded[0]["fileName"], "files": uploaded})
         except PermissionError:
-            self.respond(401, {"error": "Invalid or expired session"})
+            self.respond(401, {"success": False, "message": "Invalid or expired session"})
         except ValueError as exc:
-            self.respond(400, {"error": str(exc)})
+            self.respond(400, {"success": False, "message": str(exc)})
         except Exception:
-            traceback.print_exc()
             self.respond(500, {"success": False, "message": "Search and redaction failed"})

@@ -1,7 +1,19 @@
 [project]
-name = "impromarkas-dim-api"
-version = "1.0.0"
+name = "dim-backend"
+version = "0.1.0"
 requires-python = ">=3.12"
+dependencies = [
+    "requests>=2.31.0",
+    "psycopg[binary]>=3.1.0",
+    "psycopg2-binary>=2.9.9",
+    "psycopg-pool>=3.2.0",
+    "PyPDF2>=3.0.0",
+    "pymupdf>=1.23.0",
+    "pyjwt>=2.8.0",
+    "python-dotenv>=1.0.0",
+    "pandas>=2.0.0",
+    "openpyxl>=3.1.0"
+]
 
 [tool.vercel]
 entrypoint = "api.index:handler"

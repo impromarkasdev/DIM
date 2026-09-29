@@ -1,6 +1,18 @@
-PyMuPDF==1.23.8
-requests==2.31.0
-pandas==2.1.4
-openpyxl==3.1.2
-psycopg[binary]==3.2.13
-psycopg-pool==3.2.6
+# Microsoft Graph HTTP client
+requests>=2.31.0
+
+# PostgreSQL / Neon persistence
+psycopg[binary]>=3.1.0
+psycopg-pool>=3.2.0
+
+# PDF processing: PyMuPDF provides the `fitz` module used by app/pdf_*.py.
+pymupdf>=1.23.0
+PyPDF2>=3.0.0
+
+# Authentication and environment configuration
+pyjwt>=2.8.0
+python-dotenv>=1.0.0
+
+# In-memory Excel lookup
+pandas>=2.1.0
+openpyxl>=3.1.0

@@ -94,8 +94,15 @@ class GraphClient:
         relative = "/".join(parts[documents_index + 1:])
         return (owner, GraphClient._safe_path(relative)) if relative else None
 
-    def resolve_file(self, file_path: str) -> tuple[bytes, str, str]:
-        """Return file bytes, source filename and destination drive base.
+    @staticmethod
+    def _parent_path(parent_reference: dict[str, Any]) -> str:
+        """Convert Graph parentReference.path to a root-relative safe path."""
+        graph_path = str(parent_reference.get("path", ""))
+        marker = "root:/"
+        return GraphClient._safe_path(graph_path.split(marker, 1)[1]) if marker in graph_path else ""
+
+    def resolve_file(self, file_path: str) -> tuple[bytes, str, str, str]:
+        """Return bytes, filename, drive base and the source's parent folder path.
 
         Shared URL uses Graph shares first. A personal-site URL falls back to the
         owner's drive, which works when an application has Files.ReadWrite.All.
@@ -109,7 +116,7 @@ class GraphClient:
                 if drive_id and item.get("id"):
                     base = f"{self.base}/drives/{quote(drive_id, safe='')}"
                     content = self._request("GET", f"{base}/items/{quote(str(item['id']), safe='')}/content").content
-                    return content, str(item.get("name", "documento.pdf")), base
+                    return content, str(item.get("name", "documento.pdf")), base, self._parent_path(item.get("parentReference", {}))
             except RuntimeError:
                 fallback = self._owner_from_personal_url(value)
                 if not fallback:
@@ -117,15 +124,16 @@ class GraphClient:
                 owner, path = fallback
                 base = f"{self.base}/users/{quote(owner, safe='@')}/drive"
                 content = self._request("GET", f"{base}/root:/{quote(path, safe='/')}:/content").content
-                return content, path.rsplit("/", 1)[-1], base
+                return content, path.rsplit("/", 1)[-1], base, path.rsplit("/", 1)[0] if "/" in path else ""
             raise RuntimeError("Graph API returned an invalid shared DriveItem")
         if value.startswith("id:"):
             item_id = quote(value[3:].strip(), safe="")
             if not item_id: raise ValueError("DriveItem id cannot be empty")
-            item = self._request("GET", f"{self.drive_base}/items/{item_id}?$select=name").json()
-            return self._request("GET", f"{self.drive_base}/items/{item_id}/content").content, str(item.get("name", "documento.pdf")), self.drive_base
+            item = self._request("GET", f"{self.drive_base}/items/{item_id}?$select=name,parentReference").json()
+            return self._request("GET", f"{self.drive_base}/items/{item_id}/content").content, str(item.get("name", "documento.pdf")), self.drive_base, self._parent_path(item.get("parentReference", {}))
         path = self._safe_path(value)
-        return self._request("GET", f"{self.drive_base}/root:/{quote(path, safe='/')}:/content").content, path.rsplit("/", 1)[-1], self.drive_base
+        parent = path.rsplit("/", 1)[0] if "/" in path else ""
+        return self._request("GET", f"{self.drive_base}/root:/{quote(path, safe='/')}:/content").content, path.rsplit("/", 1)[-1], self.drive_base, parent
 
     def connection_status(self) -> dict[str, str]:
         """Validate delegated identity, selected OneDrive and workbook access without returning secrets."""

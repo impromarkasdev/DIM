@@ -16,10 +16,11 @@ class handler(ApiHandler):
             if not (file_path.lower().endswith(".pdf") or file_path.startswith(("id:", "https://"))):
                 raise ValueError("filePath must be a PDF path or an id:<DriveItem-id> value")
             graph = GraphClient(Settings.from_env())
-            content, filename, source_drive = graph.resolve_file(file_path)
+            content, filename, source_drive, parent_folder = graph.resolve_file(file_path)
             files = split_pages(content, filename)
-            graph.upload_many_pdfs("Procesados", files, drive_base=source_drive)
-            self.respond(200, {"success": True, "count": len(files), "message": "PDF dividido con éxito"})
+            output_folder = f"{parent_folder}/Procesados" if parent_folder else "Procesados"
+            graph.upload_many_pdfs(output_folder, files, drive_base=source_drive)
+            self.respond(200, {"success": True, "count": len(files), "message": "PDF dividido con éxito", "outputFolder": f"/{output_folder}"})
         except PermissionError:
             self.respond(403, {"success": False, "message": "Administrator access required"})
         except ValueError as exc:

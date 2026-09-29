@@ -47,6 +47,13 @@ class GraphClient:
             status = getattr(exc.response, "status_code", "unavailable")
             raise RuntimeError(f"Microsoft Graph request failed ({status})") from exc
 
+    def _request_details(self, method: str, url: str, **kwargs: Any) -> requests.Response:
+        """Graph error with status and a safe Graph code for API responses."""
+        try:
+            return self._request(method, url, **kwargs)
+        except RuntimeError as exc:
+            raise RuntimeError(str(exc)) from exc
+
     @staticmethod
     def _safe_path(value: str) -> str:
         path = unquote(value).strip().replace("\\", "/")
@@ -63,6 +70,62 @@ class GraphClient:
             raise ValueError("Only valid HTTPS SharePoint or OneDrive URLs are allowed")
         encoded = base64.urlsafe_b64encode(shared_url.encode()).decode().rstrip("=")
         return f"{self.base}/shares/u!{encoded}/driveItem/content"
+
+    @staticmethod
+    def _shared_token(shared_url: str) -> str:
+        return "u!" + base64.urlsafe_b64encode(shared_url.encode("utf-8")).decode("utf-8").rstrip("=")
+
+    @staticmethod
+    def _owner_from_personal_url(shared_url: str) -> tuple[str, str] | None:
+        """Return owner email and OneDrive-internal path for /personal/<upn>/Documents/... URLs."""
+        parsed = urlparse(shared_url)
+        parts = [unquote(part) for part in parsed.path.split("/") if part]
+        if len(parts) < 3 or parts[0].lower() != "personal":
+            return None
+        local = parts[1]
+        if "_" not in local:
+            return None
+        # In OneDrive personal URLs, UPN uses '_' in place of '@' and dots.
+        owner = local.replace("_", "@", 1).replace("_", ".")
+        try:
+            documents_index = next(index for index, value in enumerate(parts) if value.lower() == "documents")
+        except StopIteration:
+            return None
+        relative = "/".join(parts[documents_index + 1:])
+        return (owner, GraphClient._safe_path(relative)) if relative else None
+
+    def resolve_file(self, file_path: str) -> tuple[bytes, str, str]:
+        """Return file bytes, source filename and destination drive base.
+
+        Shared URL uses Graph shares first. A personal-site URL falls back to the
+        owner's drive, which works when an application has Files.ReadWrite.All.
+        """
+        value = unquote(file_path).strip()
+        if value.startswith("https://"):
+            token = self._shared_token(value)
+            try:
+                item = self._request("GET", f"{self.base}/shares/{token}/driveItem?$select=id,name,parentReference").json()
+                drive_id = str(item.get("parentReference", {}).get("driveId", ""))
+                if drive_id and item.get("id"):
+                    base = f"{self.base}/drives/{quote(drive_id, safe='')}"
+                    content = self._request("GET", f"{base}/items/{quote(str(item['id']), safe='')}/content").content
+                    return content, str(item.get("name", "documento.pdf")), base
+            except RuntimeError:
+                fallback = self._owner_from_personal_url(value)
+                if not fallback:
+                    raise
+                owner, path = fallback
+                base = f"{self.base}/users/{quote(owner, safe='@')}/drive"
+                content = self._request("GET", f"{base}/root:/{quote(path, safe='/')}:/content").content
+                return content, path.rsplit("/", 1)[-1], base
+            raise RuntimeError("Graph API returned an invalid shared DriveItem")
+        if value.startswith("id:"):
+            item_id = quote(value[3:].strip(), safe="")
+            if not item_id: raise ValueError("DriveItem id cannot be empty")
+            item = self._request("GET", f"{self.drive_base}/items/{item_id}?$select=name").json()
+            return self._request("GET", f"{self.drive_base}/items/{item_id}/content").content, str(item.get("name", "documento.pdf")), self.drive_base
+        path = self._safe_path(value)
+        return self._request("GET", f"{self.drive_base}/root:/{quote(path, safe='/')}:/content").content, path.rsplit("/", 1)[-1], self.drive_base
 
     def connection_status(self) -> dict[str, str]:
         """Validate delegated identity, selected OneDrive and workbook access without returning secrets."""
@@ -111,11 +174,12 @@ class GraphClient:
         encoded = quote(self._safe_path(path), safe="/")
         return self._request("GET", f"{self.drive_base}/root:/{encoded}:/content").content
 
-    def ensure_folder(self, folder: str) -> None:
+    def ensure_folder(self, folder: str, drive_base: str | None = None) -> None:
+        drive_base = drive_base or self.drive_base
         current = ""
         for segment in self._safe_path(folder).split("/"):
             parent = quote(current, safe="/")
-            url = f"{self.drive_base}/root:/{parent}:/children" if current else f"{self.drive_base}/root/children"
+            url = f"{drive_base}/root:/{parent}:/children" if current else f"{drive_base}/root/children"
             try:
                 self._request("POST", url, json={"name": segment, "folder": {}, "@microsoft.graph.conflictBehavior": "fail"})
             except RuntimeError:
@@ -123,18 +187,20 @@ class GraphClient:
                 pass
             current = f"{current}/{segment}" if current else segment
 
-    def upload_pdf(self, path: str, content: bytes) -> dict[str, Any]:
+    def upload_pdf(self, path: str, content: bytes, drive_base: str | None = None) -> dict[str, Any]:
+        drive_base = drive_base or self.drive_base
         clean = self._safe_path(path)
         parent = clean.rsplit("/", 1)[0] if "/" in clean else ""
-        if parent: self.ensure_folder(parent)
+        if parent: self.ensure_folder(parent, drive_base)
         encoded = quote(clean, safe="/")
-        return self._request("PUT", f"{self.drive_base}/root:/{encoded}:/content", data=content, headers={"Content-Type": "application/pdf"}).json()
+        return self._request("PUT", f"{drive_base}/root:/{encoded}:/content", data=content, headers={"Content-Type": "application/pdf"}).json()
 
-    def upload_many_pdfs(self, folder: str, files: list[tuple[str, bytes]], max_workers: int = 4) -> list[dict[str, Any]]:
-        self.ensure_folder(folder)
+    def upload_many_pdfs(self, folder: str, files: list[tuple[str, bytes]], max_workers: int = 4, drive_base: str | None = None) -> list[dict[str, Any]]:
+        drive_base = drive_base or self.drive_base
+        self.ensure_folder(folder, drive_base)
         def upload(file: tuple[str, bytes]) -> dict[str, Any]:
             name, content = file
             if "/" in name or "\\" in name: raise ValueError("Output filename must not contain a path")
-            return self.upload_pdf(f"{folder}/{name}", content)
+            return self.upload_pdf(f"{folder}/{name}", content, drive_base)
         with ThreadPoolExecutor(max_workers=min(max_workers, len(files) or 1)) as executor:
             return list(executor.map(upload, files))

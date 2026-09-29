@@ -7,6 +7,7 @@ from typing import Any
 from urllib.parse import quote, unquote, urlparse
 
 import requests
+from requests.adapters import HTTPAdapter
 
 from .config import Settings
 
@@ -15,6 +16,8 @@ class GraphClient:
     def __init__(self, settings: Settings) -> None:
         self.settings = settings
         self.session = requests.Session()
+        adapter = HTTPAdapter(pool_connections=10, pool_maxsize=10, max_retries=1)
+        self.session.mount("https://", adapter)
         self.token = self._get_token()
         self.base = "https://graph.microsoft.com/v1.0"
         self.drive_base = f"{self.base}/drives/{settings.drive_id}" if settings.drive_id else (f"{self.base}/users/{settings.graph_user_id}/drive" if settings.graph_user_id else f"{self.base}/me/drive")
@@ -195,20 +198,20 @@ class GraphClient:
                 pass
             current = f"{current}/{segment}" if current else segment
 
-    def upload_pdf(self, path: str, content: bytes, drive_base: str | None = None) -> dict[str, Any]:
+    def upload_pdf(self, path: str, content: bytes, drive_base: str | None = None, ensure_parent: bool = True) -> dict[str, Any]:
         drive_base = drive_base or self.drive_base
         clean = self._safe_path(path)
         parent = clean.rsplit("/", 1)[0] if "/" in clean else ""
-        if parent: self.ensure_folder(parent, drive_base)
+        if parent and ensure_parent: self.ensure_folder(parent, drive_base)
         encoded = quote(clean, safe="/")
         return self._request("PUT", f"{drive_base}/root:/{encoded}:/content", data=content, headers={"Content-Type": "application/pdf"}).json()
 
-    def upload_many_pdfs(self, folder: str, files: list[tuple[str, bytes]], max_workers: int = 4, drive_base: str | None = None) -> list[dict[str, Any]]:
+    def upload_many_pdfs(self, folder: str, files: list[tuple[str, bytes]], max_workers: int = 10, drive_base: str | None = None) -> list[dict[str, Any]]:
         drive_base = drive_base or self.drive_base
         self.ensure_folder(folder, drive_base)
         def upload(file: tuple[str, bytes]) -> dict[str, Any]:
             name, content = file
             if "/" in name or "\\" in name: raise ValueError("Output filename must not contain a path")
-            return self.upload_pdf(f"{folder}/{name}", content, drive_base)
+            return self.upload_pdf(f"{folder}/{name}", content, drive_base, ensure_parent=False)
         with ThreadPoolExecutor(max_workers=min(max_workers, len(files) or 1)) as executor:
             return list(executor.map(upload, files))

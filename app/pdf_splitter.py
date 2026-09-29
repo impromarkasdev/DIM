@@ -53,7 +53,7 @@ def split_declarations(pdf_bytes: bytes) -> list[tuple[str, bytes]]:
 
 
 def split_pages(pdf_bytes: bytes, original_name: str) -> list[tuple[str, bytes]]:
-    """Create one sanitized PDF per nonblank page for the OneDrive split endpoint."""
+    """Copy nonblank pages with their existing PDF objects; avoid expensive re-rendering."""
     try:
         source = fitz.open(stream=pdf_bytes, filetype="pdf")
     except fitz.FileDataError as exc:
@@ -63,8 +63,12 @@ def split_pages(pdf_bytes: bytes, original_name: str) -> list[tuple[str, bytes]]
     for page_number, page in enumerate(source, start=1):
         if _is_blank(page):
             continue
-        document = fitz.open(); document.insert_pdf(source, from_page=page_number - 1, to_page=page_number - 1); document.set_metadata({})
-        output = io.BytesIO(); document.save(output, garbage=4, deflate=True, clean=True); document.close()
+        document = fitz.open()
+        document.insert_pdf(source, from_page=page_number - 1, to_page=page_number - 1)
+        # `garbage=4`, `clean`, and `deflate` reprocess every stream and make a
+        # 60+ page job unnecessarily slow. The source is trusted PDF input from
+        # OneDrive and each output contains a direct page copy only.
+        output = io.BytesIO(); document.save(output, garbage=0, deflate=False); document.close()
         result.append((f"{stem}_pagina_{page_number:03d}.pdf", output.getvalue()))
     source.close()
     if not result: raise ValueError("The PDF contains only blank pages")

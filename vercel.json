@@ -17,6 +17,11 @@
     {"src": "/api/dim/search-and-redact", "dest": "/api/dim/search_redact.py"},
     {"src": "/api/documents/process-redact", "dest": "/api/dim/search_redact.py"}
   ],
+  "functions": {
+    "api/admin/split_pdf.py": {
+      "maxDuration": 60
+    }
+  },
   "crons": [
     {"path": "/api/cron/keep-alive", "schedule": "0 0 * * 1"}
   ]

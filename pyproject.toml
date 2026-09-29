@@ -2,13 +2,3 @@
 name = "impromarkas-dim-api"
 version = "1.0.0"
 requires-python = ">=3.12"
-
-[tool.vercel]
-entrypoint = [
-  "api/auth/login.py:handler",
-  "api/admin/users.py:handler",
-  "api/admin/split_pdf.py:handler",
-  "api/dim/search_redact.py:handler",
-  "api/cron/keep_alive.py:handler",
-  "api/process.py:handler"
-]

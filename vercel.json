@@ -1,20 +1,7 @@
 {
-  "version": 2,
   "functions": {
-    "api/index.py": {
+    "api/**/*.py": {
       "maxDuration": 60
     }
-  },
-  "routes": [
-    {"src": "/api/process", "dest": "/api/index.py?path=/api/process"},
-    {"src": "/api/auth/login", "dest": "/api/index.py?path=/api/auth/login"},
-    {"src": "/api/admin/users", "dest": "/api/index.py?path=/api/admin/users"},
-    {"src": "/api/admin/split-pdf", "dest": "/api/index.py?path=/api/admin/split-pdf"},
-    {"src": "/api/documents/process-redact", "dest": "/api/index.py?path=/api/documents/process-redact"},
-    {"src": "/api/dim/search-and-redact", "dest": "/api/index.py?path=/api/dim/search-and-redact"},
-    {"src": "/api/cron/keep-alive", "dest": "/api/index.py?path=/api/cron/keep-alive"}
-  ],
-  "crons": [
-    {"path": "/api/cron/keep-alive", "schedule": "0 0 * * 1"}
-  ]
+  }
 }

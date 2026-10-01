@@ -77,14 +77,18 @@ def split_declarations(pdf_bytes: bytes) -> list[tuple[str, bytes]]:
                 # the canonical matched token (with its hyphen) as filename.
                 form_number = _find_form_number(text)
                 if form_number is None:
-                    logger.info("PDF split: text extraction did not find Campo 4 on page %s; trying OCR", page_number + 1)
-                    form_number = _find_form_number(_ocr_page_text(page, page_number + 1))
+                    compact_text = re.sub(r"\s+", "", text)
+                    if len(compact_text) < 40:
+                        logger.info("PDF split: page %s has no usable Campo 4 text; trying OCR", page_number + 1)
+                        form_number = _find_form_number(_ocr_page_text(page, page_number + 1))
+                    else:
+                        logger.info("PDF split: page %s has readable text but no Campo 4; treating as continuation", page_number + 1)
                 if form_number:
                     current = form_number
                     groups.setdefault(current, [])
                     logger.info("PDF split: declaration %s matched on page %s", current, page_number + 1)
                 else:
-                    logger.warning("PDF split: Campo 4 regex did not match on page %s after text extraction and OCR", page_number + 1)
+                    logger.info("PDF split: Campo 4 regex did not match on page %s", page_number + 1)
                 if current is not None:
                     groups[current].append(page_number)
             if not groups:

@@ -20,6 +20,7 @@ class Settings:
     location_column_index: int
     first_year: int
     max_response_pdf_bytes: int
+    dim_base_path: str
     webhook_secret: str
     cron_secret: str
     standard_sensitive_terms: tuple[str, ...]
@@ -62,6 +63,11 @@ class Settings:
         values["azure_scopes"] = os.getenv(
             "AZURE_SCOPES", "offline_access User.Read Files.ReadWrite"
         ).strip()
+        values["dim_base_path"] = os.getenv(
+            "DIM_BASE_PATH", "Documents/Impromarkas/Facturas - Compras - Argelia"
+        ).strip().strip("/")
+        if not values["dim_base_path"]:
+            raise RuntimeError("DIM_BASE_PATH cannot be empty")
         if not values["azure_scopes"]:
             raise RuntimeError("AZURE_SCOPES cannot be empty")
         return cls(

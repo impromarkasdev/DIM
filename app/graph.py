@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 import base64
+import logging
+import time
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import PurePosixPath
 from typing import Any
@@ -10,6 +12,9 @@ import requests
 from requests.adapters import HTTPAdapter
 
 from .config import Settings
+
+logging.basicConfig(level=logging.INFO)
+logger = logging.getLogger(__name__)
 
 
 class GraphClient:
@@ -42,13 +47,41 @@ class GraphClient:
     def _request(self, method: str, url: str, **kwargs: Any) -> requests.Response:
         headers = kwargs.pop("headers", {})
         headers["Authorization"] = f"Bearer {self.token}"
-        try:
-            response = self.session.request(method, url, headers=headers, timeout=45, **kwargs)
-            response.raise_for_status()
-            return response
-        except requests.RequestException as exc:
-            status = getattr(exc.response, "status_code", "unavailable")
-            raise RuntimeError(f"Microsoft Graph request failed ({status})") from exc
+        attempts = 3
+        request_timeout = kwargs.pop("timeout", 18)
+        for attempt in range(1, attempts + 1):
+            logger.info("Graph request start: %s %s (attempt %s/%s)", method, self._safe_log_url(url), attempt, attempts)
+            try:
+                response = self.session.request(method, url, headers=headers, timeout=request_timeout, **kwargs)
+                if response.status_code == 429 or response.status_code >= 500:
+                    if attempt < attempts:
+                        retry_after = response.headers.get("Retry-After", "")
+                        delay = min(float(retry_after), 10.0) if retry_after.replace(".", "", 1).isdigit() else float(attempt)
+                        logger.warning("Graph transient HTTP %s; retrying in %.1fs", response.status_code, delay)
+                        time.sleep(delay)
+                        continue
+                response.raise_for_status()
+                logger.info("Graph request complete: %s %s (HTTP %s)", method, self._safe_log_url(url), response.status_code)
+                return response
+            except requests.RequestException as exc:
+                status = getattr(exc.response, "status_code", "unavailable")
+                if attempt < attempts and (exc.response is None or status == 429 or status >= 500):
+                    delay = float(attempt)
+                    logger.warning("Graph request failed (%s); retrying in %.1fs", status, delay)
+                    time.sleep(delay)
+                    continue
+                logger.exception("Graph request failed permanently (HTTP %s)", status)
+                raise RuntimeError(f"Microsoft Graph request failed ({status})") from exc
+        raise RuntimeError("Microsoft Graph request failed after retries")
+
+    @staticmethod
+    def _safe_log_url(url: str) -> str:
+        """Log Graph endpoint shape without query values or shared-link tokens."""
+        parsed = urlparse(url)
+        path = parsed.path
+        if "/shares/" in path:
+            path = path.split("/shares/", 1)[0] + "/shares/[redacted]"
+        return f"{parsed.netloc}{path}"
 
     def _request_details(self, method: str, url: str, **kwargs: Any) -> requests.Response:
         """Graph error with status and a safe Graph code for API responses."""
@@ -167,8 +200,16 @@ class GraphClient:
 
     def download_excel(self) -> bytes:
         """Download the workbook once; local lookup avoids Graph calls per worksheet."""
+        cached = getattr(self, "_excel_cache", None)
+        if cached is not None:
+            logger.info("Graph Excel cache hit for this request")
+            return cached
         path = quote(self.settings.excel_path.strip("/"), safe="/")
-        return self._request("GET", f"{self.drive_base}/root:/{path}:/content").content
+        logger.info("Downloading master Excel once for this request")
+        content = self._request("GET", f"{self.drive_base}/root:/{path}:/content").content
+        self._excel_cache = content
+        logger.info("Master Excel download complete (%s bytes)", len(content))
+        return content
 
     def download_original(self, pdf_name: str) -> bytes:
         return self.download_path(f"Originales/{pdf_name}")
@@ -184,6 +225,30 @@ class GraphClient:
             return self._request("GET", f"{self.drive_base}/items/{item_id}/content").content
         encoded = quote(self._safe_path(path), safe="/")
         return self._request("GET", f"{self.drive_base}/root:/{encoded}:/content").content
+
+    def list_children(self, folder: str, drive_base: str | None = None) -> list[dict[str, Any]]:
+        """List one folder without relying on the user's current OneDrive root.
+
+        Graph paginates large folders, therefore all pages are read before the
+        caller decides which container or PDF it needs.
+        """
+        drive_base = drive_base or self.drive_base
+        clean = self._safe_path(folder) if folder.strip("/") else ""
+        if clean:
+            encoded = quote(clean, safe="/")
+            url = f"{drive_base}/root:/{encoded}:/children?$select=id,name,file,folder,parentReference,webUrl"
+        else:
+            url = f"{drive_base}/root/children?$select=id,name,file,folder,parentReference,webUrl"
+        children: list[dict[str, Any]] = []
+        while url:
+            payload = self._request("GET", url).json()
+            values = payload.get("value", [])
+            if not isinstance(values, list):
+                raise RuntimeError("Microsoft Graph returned an invalid folder listing")
+            children.extend(item for item in values if isinstance(item, dict))
+            next_url = payload.get("@odata.nextLink")
+            url = str(next_url) if next_url else ""
+        return children
 
     def ensure_folder(self, folder: str, drive_base: str | None = None) -> None:
         drive_base = drive_base or self.drive_base

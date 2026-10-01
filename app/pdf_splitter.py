@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import io
 import logging
+import os
 import re
 from collections import OrderedDict
 import fitz
@@ -15,7 +16,7 @@ logger = logging.getLogger(__name__)
 # Numeric DIM forms (for example ``032026001248077-6``) and historic
 # alphanumeric declarations (for example ``A367-ZF305D``).  The expression
 # deliberately preserves the hyphen because it is the public filename key.
-FORM_NUMBER = re.compile(r"(?<![A-Z0-9])(?:0?3\d{12,14}\s*-\s*\d|[A-Z]\d{2,}\s*-\s*[A-Z0-9]{3,})(?![A-Z0-9])", re.IGNORECASE)
+FORM_NUMBER = re.compile(r"(?<!\d)\d{15}\s*-\s*\d(?!\d)")
 
 
 def _is_blank(page: fitz.Page) -> bool:
@@ -28,16 +29,41 @@ def _is_blank(page: fitz.Page) -> bool:
     return sum(pixel < 245 for pixel in pixmap.samples) < 40
 
 
+def _find_form_number(text: str) -> str | None:
+    """Return a canonical 15-digit DIAN Campo 4 number despite OCR spacing."""
+    compact_text = re.sub(r"\s+", "", text)
+    match = FORM_NUMBER.search(compact_text)
+    return match.group(0) if match else None
+
+
+def _ocr_page_text(page: fitz.Page, page_number: int) -> str:
+    """OCR a rendered page when its selectable text has no Campo 4 match."""
+    try:
+        import pytesseract
+        from PIL import Image
+    except ImportError as exc:
+        raise RuntimeError("OCR requerido pero faltan pytesseract/Pillow; instálelos junto con el binario Tesseract") from exc
+    try:
+        tesseract_cmd = os.getenv("TESSERACT_CMD", "").strip()
+        if tesseract_cmd:
+            pytesseract.pytesseract.tesseract_cmd = tesseract_cmd
+        pixmap = page.get_pixmap(dpi=250, alpha=False)
+        image = Image.open(io.BytesIO(pixmap.tobytes("png")))
+        logger.info("PDF split: OCR started on page %s", page_number)
+        text = pytesseract.image_to_string(image, config="--oem 1 --psm 6")
+        logger.info("PDF split: OCR completed on page %s (%s characters)", page_number, len(text))
+        return text
+    except pytesseract.TesseractNotFoundError as exc:
+        raise RuntimeError("OCR requerido pero el ejecutable Tesseract no está instalado/configurado") from exc
+    except Exception as exc:
+        logger.exception("PDF split: OCR failed on page %s", page_number)
+        raise RuntimeError(f"OCR failed on page {page_number}") from exc
+
+
 def split_declarations(pdf_bytes: bytes) -> list[tuple[str, bytes]]:
     try:
         with fitz.open(stream=pdf_bytes, filetype="pdf") as source:
-            # Preflight the extracted layer first. Scanned/image-only PDFs should
-            # fail before the more expensive blank-page rendering and grouping.
             page_texts = [page.get_text("text") for page in source]
-            if sum(len(re.sub(r"\s+", "", text)) for text in page_texts) < 3:
-                logger.warning("PDF split rejected: no readable text layer")
-                raise ValueError("PDF sin capa de texto. Requiere OCR manual")
-
             # Keep source page indexes: fitz.Page objects are tied to the
             # document lifetime and cannot safely outlive this context.
             groups: OrderedDict[str, list[int]] = OrderedDict()
@@ -49,19 +75,21 @@ def split_declarations(pdf_bytes: bytes) -> list[tuple[str, bytes]]:
                 # OCR engines may insert whitespace inside the form number or
                 # split it across lines. Compact only for matching and retain
                 # the canonical matched token (with its hyphen) as filename.
-                compact_text = re.sub(r"\s+", "", text)
-                match = FORM_NUMBER.search(compact_text)
-                if match:
-                    current = re.sub(r"\s+", "", match.group(0)).upper()
+                form_number = _find_form_number(text)
+                if form_number is None:
+                    logger.info("PDF split: text extraction did not find Campo 4 on page %s; trying OCR", page_number + 1)
+                    form_number = _find_form_number(_ocr_page_text(page, page_number + 1))
+                if form_number:
+                    current = form_number
                     groups.setdefault(current, [])
                     logger.info("PDF split: declaration %s matched on page %s", current, page_number + 1)
                 else:
-                    logger.info("PDF split: no declaration regex match on page %s", page_number + 1)
+                    logger.warning("PDF split: Campo 4 regex did not match on page %s after text extraction and OCR", page_number + 1)
                 if current is not None:
                     groups[current].append(page_number)
             if not groups:
                 logger.warning("PDF split: readable text exists but no declaration regex matched")
-                raise ValueError("No declaration form number was found in the PDF")
+                raise ValueError("No se encontró el Número de Formulario de 15 dígitos-guion-dígito en el PDF, ni con OCR")
             result: list[tuple[str, bytes]] = []
             for form_number, pages in groups.items():
                 with fitz.open() as document:

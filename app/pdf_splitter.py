@@ -11,12 +11,9 @@ logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
 
-# DIMs normally use a long numeric declaration (e.g. 032026000884560-6),
-# but older documents can expose an alphanumeric declaration code.
-# Numeric DIM forms (for example ``032026001248077-6``) and historic
-# alphanumeric declarations (for example ``A367-ZF305D``).  The expression
-# deliberately preserves the hyphen because it is the public filename key.
-FORM_NUMBER = re.compile(r"(?<!\d)\d{15}\s*-\s*\d(?!\d)")
+# DIAN Campo 4 contains exactly 15 digits and a verification digit after a hyphen.
+FIELD_4_LABEL = re.compile(r"\b4\s*\.?\s*N[uú]mero\s+de\s+formulario", re.IGNORECASE)
+FORM_NUMBER = re.compile(r"(?<!\d)((?:\d[\s\u00a0]*){15})[\s\u00a0]*[-‐‑‒–—−][\s\u00a0]*(\d)(?!\d)")
 
 
 def _is_blank(page: fitz.Page) -> bool:
@@ -30,10 +27,19 @@ def _is_blank(page: fitz.Page) -> bool:
 
 
 def _find_form_number(text: str) -> str | None:
-    """Return a canonical 15-digit DIAN Campo 4 number despite OCR spacing."""
-    compact_text = re.sub(r"\s+", "", text)
-    match = FORM_NUMBER.search(compact_text)
-    return match.group(0) if match else None
+    """Read the 15-digit id specifically from DIAN Campo 4, allowing OCR spaces/dashes."""
+    label = FIELD_4_LABEL.search(text)
+    if not label:
+        return None
+    # Restrict the candidate to the text immediately following Campo 4. This
+    # prevents acceptance numbers, tax ids, and unrelated long values elsewhere
+    # on the page from starting a new declaration group.
+    field_text = text[label.end():label.end() + 240]
+    match = FORM_NUMBER.search(field_text)
+    if not match:
+        return None
+    digits = "".join(re.findall(r"\d", match.group(1)))
+    return f"{digits}-{match.group(2)}" if len(digits) == 15 else None
 
 
 def _ocr_page_text(page: fitz.Page, page_number: int) -> str:
@@ -60,7 +66,7 @@ def _ocr_page_text(page: fitz.Page, page_number: int) -> str:
         raise RuntimeError(f"OCR failed on page {page_number}") from exc
 
 
-def split_declarations(pdf_bytes: bytes) -> list[tuple[str, bytes]]:
+def split_declarations_with_report(pdf_bytes: bytes) -> tuple[list[tuple[str, bytes]], list[int]]:
     try:
         with fitz.open(stream=pdf_bytes, filetype="pdf") as source:
             page_texts = [page.get_text("text") for page in source]
@@ -68,17 +74,20 @@ def split_declarations(pdf_bytes: bytes) -> list[tuple[str, bytes]]:
             # document lifetime and cannot safely outlive this context.
             groups: OrderedDict[str, list[int]] = OrderedDict()
             current: str | None = None
+            skipped_pages: list[int] = []
             for page_number, (page, text) in enumerate(zip(source, page_texts)):
                 if _is_blank(page):
                     logger.info("PDF split: blank page %s skipped", page_number + 1)
                     continue
-                # OCR engines may insert whitespace inside the form number or
-                # split it across lines. Compact only for matching and retain
-                # the canonical matched token (with its hyphen) as filename.
+                # Only a Campo 4 number starts a new declaration. All following
+                # nonblank pages remain with that declaration until the next
+                # Campo 4 page. Pages before the first main declaration page
+                # are detached supplements and cannot become a wrongly named
+                # output document.
                 form_number = _find_form_number(text)
                 if form_number is None:
                     compact_text = re.sub(r"\s+", "", text)
-                    if len(compact_text) < 40:
+                    if len(compact_text) < 40 or FIELD_4_LABEL.search(text):
                         logger.info("PDF split: page %s has no usable Campo 4 text; trying OCR", page_number + 1)
                         form_number = _find_form_number(_ocr_page_text(page, page_number + 1))
                     else:
@@ -86,11 +95,12 @@ def split_declarations(pdf_bytes: bytes) -> list[tuple[str, bytes]]:
                 if form_number:
                     current = form_number
                     groups.setdefault(current, [])
-                    logger.info("PDF split: declaration %s matched on page %s", current, page_number + 1)
-                else:
-                    logger.info("PDF split: Campo 4 regex did not match on page %s", page_number + 1)
+                    logger.info("PDF split: Campo 4 declaration %s starts on page %s", current, page_number + 1)
                 if current is not None:
                     groups[current].append(page_number)
+                else:
+                    skipped_pages.append(page_number + 1)
+                    logger.info("PDF split: page %s skipped because no main Campo 4 page has started yet", page_number + 1)
             if not groups:
                 logger.warning("PDF split: readable text exists but no declaration regex matched")
                 raise ValueError("No se encontró el Número de Formulario de 15 dígitos-guion-dígito en el PDF, ni con OCR")
@@ -101,11 +111,17 @@ def split_declarations(pdf_bytes: bytes) -> list[tuple[str, bytes]]:
                         document.insert_pdf(source, from_page=page_number, to_page=page_number)
                     document.set_metadata({})
                     result.append((f"{form_number}.pdf", document.tobytes(garbage=4, deflate=True, clean=True)))
-            return result
+            return result, skipped_pages
     except fitz.FileDataError as exc:
         raise ValueError("Uploaded file is not a readable PDF") from exc
     except ValueError:
         raise
+
+
+def split_declarations(pdf_bytes: bytes) -> list[tuple[str, bytes]]:
+    """Compatibility wrapper returning only the grouped output PDFs."""
+    files, _ = split_declarations_with_report(pdf_bytes)
+    return files
 
 
 def split_pages(pdf_bytes: bytes, original_name: str) -> list[tuple[str, bytes]]:

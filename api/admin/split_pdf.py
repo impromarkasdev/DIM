@@ -5,7 +5,7 @@ import logging
 from app.config import Settings
 from app.graph import GraphClient
 from app.http_api import ApiHandler
-from app.pdf_splitter import split_declarations
+from app.pdf_splitter import split_declarations_with_report
 
 logger = logging.getLogger(__name__)
 
@@ -21,7 +21,7 @@ class handler(ApiHandler):
             logger.info("PDF split: downloading source from Graph")
             content, filename, source_drive, parent_folder = graph.resolve_file(file_path)
             logger.info("PDF split: source download complete (%s, %s bytes)", filename, len(content))
-            files = split_declarations(content)
+            files, skipped_pages = split_declarations_with_report(content)
             output_folder = f"{parent_folder}/Procesados" if parent_folder else "Procesados"
             logger.info("PDF split: uploading %s grouped declarations to %s", len(files), output_folder)
             graph.upload_many_pdfs(output_folder, files, drive_base=source_drive)
@@ -32,6 +32,7 @@ class handler(ApiHandler):
                 "message": "PDF dividido con éxito",
                 "outputFolder": f"/{output_folder}",
                 "files": [name for name, _ in files],
+                "skippedPages": skipped_pages,
             })
         except PermissionError:
             self.respond(403, {"success": False, "message": "Administrator access required"})

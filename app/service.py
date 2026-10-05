@@ -52,6 +52,15 @@ def _form_key(value: str) -> str:
     return "".join(re.findall(r"[a-z0-9]+", value.casefold()))
 
 
+def _form_pdf_name(form_number: str) -> str:
+    """Return the canonical DIAN Campo 4 filename, preserving leading zeroes."""
+    normalized = re.sub(r"\s+", "", form_number.strip().lstrip("_"))
+    match = re.fullmatch(r"(\d{15})[-‐‑‒–—−](\d)", normalized)
+    if not match:
+        raise ValueError("El número de formulario del Excel no tiene el formato DIAN esperado")
+    return f"{match.group(1)}-{match.group(2)}.pdf"
+
+
 def _years(settings: Settings) -> list[str]:
     return [str(year) for year in range(datetime.now().year, settings.first_year - 1, -1)]
 
@@ -107,7 +116,19 @@ def _shipment_matches(folder_name: str, shipment: str) -> bool:
 
 def _find_pdf(items: list[dict[str, Any]], form_number: str) -> dict[str, Any] | None:
     target = _form_key(form_number)
-    return next((item for item in items if item.get("file") is not None and str(item.get("name", "")).casefold().endswith(".pdf") and target in _form_key(str(item.get("name", "")))), None)
+    candidates = [
+        item for item in items
+        if item.get("file") is not None
+        and str(item.get("name", "")).casefold().endswith(".pdf")
+        and not str(item.get("name", "")).casefold().startswith("redactada_")
+        and target in _form_key(str(item.get("name", "")))
+    ]
+    # Prefer the exact split declaration over any file whose name merely
+    # contains the form number.
+    return next(
+        (item for item in candidates if _form_key(str(item.get("name", "")).rsplit(".", 1)[0]) == target),
+        candidates[0] if candidates else None,
+    )
 
 
 def _find_consolidated(items: list[dict[str, Any]]) -> dict[str, Any] | None:
@@ -195,6 +216,8 @@ def _walk_container(graph: GraphClient, container_path: str, diagnostics: list[s
         listings.append((path, items))
         for item in items:
             if item.get("folder") is not None:
+                if str(item.get("name", "")).casefold() in {"enviados", "redactados"}:
+                    continue
                 queue.append((f"{path}/{item['name']}", depth + 1))
     diagnostics.append(f"Se exploraron {len(listings)} carpetas del contenedor")
     return listings
@@ -231,9 +254,9 @@ def process_hierarchical_references(references: list[str], supplied_terms: list[
     graph = GraphClient(settings)
     logger.info("DIM: descargando Excel maestro desde %s", settings.excel_path)
     index = _read_master_index(graph.download_excel(), settings)
-    terms = [*settings.standard_sensitive_terms, *[value.strip() for value in supplied_terms if value.strip()]]
-    if not terms:
-        raise ValueError("Configure STANDARD_SENSITIVE_TERMS or send datosSensibles for physical redaction")
+    # The target casillas are always redacted. Only request-specific terms are
+    # supplemental; generic defaults such as "nit" must not mask field labels.
+    terms = [value.strip() for value in supplied_terms if value.strip()]
     results: list[dict[str, Any]] = []
     for raw_reference in references:
         reference, diagnostics = raw_reference.strip(), ["Excel maestro descargado"]
@@ -246,8 +269,11 @@ def process_hierarchical_references(references: list[str], supplied_terms: list[
         try:
             located = _download_hierarchical_pdf(graph, entry, settings, diagnostics)
             sanitized = redact_pdf(located.content, terms)
-            file_name = f"redactada_{located.file_name.lstrip('_')}"
-            output_folder = located.parent_folder if located.parent_folder.endswith("/Procesados") else f"{located.parent_folder}/Procesados"
+            file_name = _form_pdf_name(entry.form_number)
+            source_folder = located.parent_folder
+            if source_folder.endswith("/Procesados"):
+                source_folder = source_folder.rsplit("/", 1)[0]
+            output_folder = f"{source_folder}/Enviados"
             metadata = graph.upload_pdf(f"{output_folder}/{file_name}", sanitized, located.drive_base)
             diagnostics.append("Redacción física aplicada y archivo subido")
             results.append({"referencia": reference, "estado": "Exito", "nombre_pdf": file_name, "embarque": entry.shipment, "numeroFormulario": entry.form_number, "outputFolder": f"/{output_folder}", "downloadUrl": metadata.get("@microsoft.graph.downloadUrl", ""), "extraidoDeConsolidado": located.extracted_from_consolidated, "diagnostico": diagnostics})

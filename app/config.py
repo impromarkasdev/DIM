@@ -32,7 +32,6 @@ class Settings:
     dim_base_path: str
     webhook_secret: str
     cron_secret: str
-    standard_sensitive_terms: tuple[str, ...]
 
     @classmethod
     def from_env(cls) -> "Settings":
@@ -64,7 +63,6 @@ class Settings:
             raise RuntimeError("Excel column indexes and limits must be integers") from exc
         if min(indexes.values()) < 0 or indexes["first_year"] < 2000 or indexes["max_response_pdf_bytes"] <= 0:
             raise RuntimeError("Invalid Excel lookup indexes or response limit")
-        terms = tuple(term.strip() for term in os.getenv("STANDARD_SENSITIVE_TERMS", "").split(",") if term.strip())
         # Omit GRAPH_DRIVE_ID for the delegated user's personal OneDrive.
         values["drive_id"] = os.getenv("GRAPH_DRIVE_ID", "").strip()
         values["graph_user_id"] = os.getenv("GRAPH_USER_ID", "").strip()
@@ -85,5 +83,4 @@ class Settings:
             **indexes,
             webhook_secret=os.getenv("WEBHOOK_SECRET", ""),
             cron_secret=os.getenv("CRON_SECRET", ""),
-            standard_sensitive_terms=terms,
         )

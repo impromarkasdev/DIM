@@ -73,12 +73,15 @@ def _read_master_index(workbook: bytes, settings: Settings) -> dict[str, DimInde
         logger.info("DIM Excel: revisando hoja %s (%s filas)", year, len(frame.index))
         for column in (REFERENCE_COLUMN, SHIPMENT_COLUMN, FORM_COLUMN):
             frame.iloc[:, column] = frame.iloc[:, column].astype(str).str.strip()
+        sheet_matches = 0
         for _, row in frame.iterrows():
             reference, shipment, form_number = (_cell_text(row.iloc[column]) for column in (REFERENCE_COLUMN, SHIPMENT_COLUMN, FORM_COLUMN))
             key = _plain(reference)
             if key and shipment and form_number and key not in indexed:
                 indexed[key] = DimIndexRow(reference, year, shipment, form_number)
-                logger.info("DIM Excel: referencia encontrada en hoja %s", year)
+                sheet_matches += 1
+        logger.info("DIM Excel: indexadas %s referencias desde hoja %s", sheet_matches, year)
+    logger.info("DIM Excel: índice cargado con %s referencias", len(indexed))
     return indexed
 
 
@@ -86,8 +89,19 @@ def _shipment_matches(folder_name: str, shipment: str) -> bool:
     normalized_folder, normalized_shipment = _plain(folder_name), _plain(shipment)
     if normalized_shipment and normalized_shipment in normalized_folder:
         return True
+    shipment_container = re.search(r"\bcont(?:enedor)?\.?\s*(\d+)\b", shipment, re.IGNORECASE)
+    folder_container = re.search(r"^\s*cont(?:enedor)?\.?\s*(\d+)\b", folder_name, re.IGNORECASE)
+    if shipment_container and folder_container:
+        # Prefer the explicit leading container number. Do not confuse it with
+        # an import/order number later in names such as "Contenedor 145 - IMP2026-146".
+        return shipment_container.group(1) == folder_container.group(1)
+    if shipment_container:
+        return bool(re.search(
+            rf"\bcont(?:enedor)?\.?\s*0*{re.escape(shipment_container.group(1))}\b",
+            folder_name,
+            re.IGNORECASE,
+        ))
     numbers = re.findall(r"\d+", shipment)
-    # "Cont. 131" must find "Contenedor 131 - ..." even though the text varies.
     return bool(numbers and all(re.search(rf"(?<!\d){re.escape(number)}(?!\d)", folder_name) for number in numbers))
 
 

@@ -4,6 +4,15 @@ import os
 from dataclasses import dataclass
 
 
+def _drive_root_relative_path(value: str) -> str:
+    """Normalize a OneDrive path and ignore the web-only Documents root alias."""
+    path = value.strip().replace("\\", "/").strip("/")
+    parts = [part for part in path.split("/") if part]
+    if parts and parts[0].casefold() == "documents":
+        parts = parts[1:]
+    return "/".join(parts)
+
+
 @dataclass(frozen=True)
 class Settings:
     tenant_id: str
@@ -33,6 +42,7 @@ class Settings:
             "excel_path": "EXCEL_PATH",
         }
         values = {field: os.getenv(env_name, "").strip() for field, env_name in names.items()}
+        values["excel_path"] = _drive_root_relative_path(values["excel_path"])
         values["auth_mode"] = os.getenv("AZURE_AUTH_MODE", "client_credentials").strip()
         if values["auth_mode"] not in {"client_credentials", "refresh_token"}:
             raise RuntimeError("AZURE_AUTH_MODE must be client_credentials or refresh_token")
@@ -63,9 +73,9 @@ class Settings:
         values["azure_scopes"] = os.getenv(
             "AZURE_SCOPES", "offline_access User.Read Files.ReadWrite"
         ).strip()
-        values["dim_base_path"] = os.getenv(
-            "DIM_BASE_PATH", "Documents/Impromarkas/Facturas - Compras - Argelia"
-        ).strip().strip("/")
+        values["dim_base_path"] = _drive_root_relative_path(os.getenv(
+            "DIM_BASE_PATH", "Impromarkas/Facturas - Compras - Argelia"
+        ))
         if not values["dim_base_path"]:
             raise RuntimeError("DIM_BASE_PATH cannot be empty")
         if not values["azure_scopes"]:

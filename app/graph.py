@@ -102,7 +102,10 @@ class GraphClient:
                         graph_code = str(exc.response.json().get("error", {}).get("code", ""))
                     except (ValueError, AttributeError):
                         pass
-                logger.error("Graph request failed permanently (HTTP %s, code %s)", status, graph_code or "unknown")
+                if status == 409 and graph_code == "nameAlreadyExists" and method.upper() == "POST":
+                    logger.info("Graph folder already exists; treating nameAlreadyExists as success")
+                else:
+                    logger.error("Graph request failed permanently (HTTP %s, code %s)", status, graph_code or "unknown")
                 suffix = f", {graph_code}" if graph_code else ""
                 raise RuntimeError(f"Microsoft Graph request failed ({status}{suffix})") from exc
         raise RuntimeError("Microsoft Graph request failed after retries")
@@ -314,7 +317,7 @@ class GraphClient:
         encoded_query = quote(query, safe="")
         url = (
             f"{drive_base}/root/search(q='{encoded_query}')"
-            "?$select=id,name,file,folder,parentReference,webUrl,size"
+            "?$select=id,name,file,folder,parentReference,webUrl,size&$top=100"
         )
         results: list[dict[str, Any]] = []
         seen: set[str] = set()
@@ -331,8 +334,12 @@ class GraphClient:
                 if key not in seen:
                     seen.add(key)
                     results.append(item)
+                    if len(results) >= 100:
+                        url = ""
+                        break
             next_url = payload.get("@odata.nextLink")
-            url = str(next_url) if next_url else ""
+            if url:
+                url = str(next_url) if next_url else ""
         logger.info("Graph drive search returned %s items for query %r", len(results), query)
         return results
 
@@ -368,7 +375,23 @@ class GraphClient:
         parent = clean.rsplit("/", 1)[0] if "/" in clean else ""
         if parent and ensure_parent: self.ensure_folder(parent, drive_base)
         encoded = quote(clean, safe="/")
-        return self._request("PUT", f"{drive_base}/root:/{encoded}:/content", data=content, headers={"Content-Type": "application/pdf"}).json()
+        uploaded = self._request("PUT", f"{drive_base}/root:/{encoded}:/content", data=content, headers={"Content-Type": "application/pdf"}).json()
+        if not uploaded.get("@microsoft.graph.downloadUrl") and uploaded.get("id"):
+            item_id = quote(str(uploaded["id"]), safe="")
+            metadata_url = f"{drive_base}/items/{item_id}?$select=id,name,@microsoft.graph.downloadUrl"
+            metadata = {}
+            for attempt in range(3):
+                try:
+                    metadata = self._request("GET", metadata_url).json()
+                    break
+                except RuntimeError:
+                    if attempt == 2:
+                        raise
+                    time.sleep(attempt + 1)
+            uploaded.update(metadata)
+        if not uploaded.get("@microsoft.graph.downloadUrl"):
+            raise RuntimeError("Microsoft Graph uploaded the PDF but did not return a download URL")
+        return uploaded
 
     def upload_many_pdfs(self, folder: str, files: list[tuple[str, bytes]], max_workers: int = 10, drive_base: str | None = None) -> list[dict[str, Any]]:
         drive_base = drive_base or self.drive_base

@@ -199,7 +199,7 @@ def _global_form_matches(graph: GraphClient, form_number: str) -> list[dict[str,
     return list(matches.values())
 
 
-def _global_pdf_content_candidates(graph: GraphClient, form_number: str, limit: int = 12) -> list[dict[str, Any]]:
+def _global_pdf_content_candidates(graph: GraphClient, form_number: str, limit: int = 3) -> list[dict[str, Any]]:
     """Return indexed PDF hits for the form number, including consolidated files.
 
     Microsoft Graph search can match file content as well as names. We verify
@@ -247,8 +247,10 @@ def _global_consolidated_items(graph: GraphClient, shipment: str) -> list[dict[s
         segments = _item_parent_path(item).split("/")
         # Keep shipment-matching candidates first and a small bounded fallback
         # in case both the year and the folder naming convention have changed.
-        if any(_shipment_matches(segment, shipment) for segment in segments) or len(candidates) < 25:
+        if any(_shipment_matches(segment, shipment) for segment in segments):
             candidates[str(item.get("id", item.get("name", "")))] = item
+            if len(candidates) >= 5:
+                break
     return list(candidates.values())
 
 
@@ -403,22 +405,6 @@ def _download_hierarchical_pdf(graph: GraphClient, entry: DimIndexRow, settings:
                 diagnostics.append("PDF individual encontrado dentro del contenedor localizado globalmente")
                 return LocatedPdf(graph.download_item(direct), str(direct["name"]), path, _item_drive_base(graph, direct))
 
-    # Graph's drive search can also match PDF contents. Verify candidate PDFs
-    # directly so an oddly named consolidated file can still be located even
-    # when its year/container folders have been moved or renamed.
-    for candidate in _global_pdf_content_candidates(graph, entry.form_number):
-        name = str(candidate.get("name", "documento.pdf"))
-        try:
-            extracted = _extract_declaration(graph.download_item(candidate), entry.form_number)
-        except RuntimeError as exc:
-            logger.info("DIM %s: búsqueda por contenido descarta %s: %s", entry.reference, name, exc)
-            continue
-        diagnostics.append("Declaración localizada por contenido del PDF en búsqueda global")
-        return LocatedPdf(
-            extracted, f"{entry.form_number.lstrip('_')}.pdf", _item_parent_path(candidate),
-            _item_drive_base(graph, candidate), True,
-        )
-
     # Only after all individual PDFs have been checked, use a consolidated DIM.
     for path, items in all_listings:
         consolidated = _find_consolidated(items)
@@ -439,6 +425,22 @@ def _download_hierarchical_pdf(graph: GraphClient, entry: DimIndexRow, settings:
             continue
         diagnostics.append("Declaración extraída del DIM consolidado mediante búsqueda global")
         return LocatedPdf(extracted, f"{entry.form_number.lstrip('_')}.pdf", parent, _item_drive_base(graph, consolidated), True)
+
+    # Last resort: Graph may index the form number from PDF contents even if a
+    # consolidated file was renamed. Try only a few likely candidates so a miss
+    # cannot turn into a long scan and a Wix-side timeout.
+    for candidate in _global_pdf_content_candidates(graph, entry.form_number):
+        name = str(candidate.get("name", "documento.pdf"))
+        try:
+            extracted = _extract_declaration(graph.download_item(candidate), entry.form_number)
+        except RuntimeError as exc:
+            logger.info("DIM %s: búsqueda por contenido descarta %s: %s", entry.reference, name, exc)
+            continue
+        diagnostics.append("Declaración localizada por contenido del PDF en búsqueda global")
+        return LocatedPdf(
+            extracted, f"{entry.form_number.lstrip('_')}.pdf", _item_parent_path(candidate),
+            _item_drive_base(graph, candidate), True,
+        )
     raise RuntimeError("No se encontró el contenedor o la declaración indicada en SharePoint")
 
 

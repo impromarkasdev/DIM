@@ -20,6 +20,7 @@ logger = logging.getLogger(__name__)
 class GraphClient:
     def __init__(self, settings: Settings) -> None:
         self.settings = settings
+        self.had_transient_failure = False
         self.session = requests.Session()
         adapter = HTTPAdapter(pool_connections=10, pool_maxsize=10, max_retries=1)
         self.session.mount("https://", adapter)
@@ -29,20 +30,36 @@ class GraphClient:
 
     def _get_token(self) -> str:
         url = f"https://login.microsoftonline.com/{self.settings.tenant_id}/oauth2/v2.0/token"
-        try:
-            data = {
-                "client_id": self.settings.client_id,
-                "client_secret": self.settings.client_secret,
-            }
-            if self.settings.auth_mode == "client_credentials":
-                data.update({"scope": "https://graph.microsoft.com/.default", "grant_type": "client_credentials"})
-            else:
-                data.update({"refresh_token": self.settings.refresh_token, "scope": self.settings.azure_scopes, "grant_type": "refresh_token"})
-            response = self.session.post(url, data=data, timeout=20)
-            response.raise_for_status()
-            return str(response.json()["access_token"])
-        except (requests.RequestException, KeyError, ValueError) as exc:
-            raise RuntimeError("Could not obtain Microsoft Graph access token") from exc
+        data = {
+            "client_id": self.settings.client_id,
+            "client_secret": self.settings.client_secret,
+        }
+        if self.settings.auth_mode == "client_credentials":
+            data.update({"scope": "https://graph.microsoft.com/.default", "grant_type": "client_credentials"})
+        else:
+            data.update({"refresh_token": self.settings.refresh_token, "scope": self.settings.azure_scopes, "grant_type": "refresh_token"})
+        for attempt in range(1, 4):
+            try:
+                response = self.session.post(url, data=data, timeout=12)
+                if response.status_code == 429 or response.status_code >= 500:
+                    if attempt < 3:
+                        retry_after = response.headers.get("Retry-After", "")
+                        delay = min(float(retry_after), 5.0) if retry_after.isdigit() else float(attempt)
+                        logger.warning("Azure token endpoint HTTP %s; retrying in %.1fs", response.status_code, delay)
+                        time.sleep(delay)
+                        continue
+                response.raise_for_status()
+                return str(response.json()["access_token"])
+            except (requests.RequestException, KeyError, ValueError) as exc:
+                status = getattr(getattr(exc, "response", None), "status_code", None)
+                retryable = status is None or status == 429 or status >= 500
+                if attempt < 3 and retryable:
+                    logger.warning("Azure token request failed; retry %s/3", attempt + 1)
+                    time.sleep(float(attempt))
+                    continue
+                logger.error("Could not obtain Microsoft Graph token (HTTP %s)", status or "unavailable")
+                raise RuntimeError("Could not obtain Microsoft Graph access token") from exc
+        raise RuntimeError("Could not obtain Microsoft Graph access token")
 
     def _request(self, method: str, url: str, **kwargs: Any) -> requests.Response:
         headers = kwargs.pop("headers", {})
@@ -70,13 +87,15 @@ class GraphClient:
                 # a hierarchy, without retrying conflicting writes.
                 retryable = (
                     exc.response is None or status == 429 or status >= 500
-                    or (status == 409 and method.upper() == "GET")
+                    or (status == 409 and method.upper() in {"GET", "PUT"})
                 )
                 if attempt < attempts and retryable:
                     delay = float(attempt)
                     logger.warning("Graph request failed (HTTP %s); retrying in %.1fs", status, delay)
                     time.sleep(delay)
                     continue
+                if retryable:
+                    self.had_transient_failure = True
                 graph_code = ""
                 if exc.response is not None:
                     try:
@@ -264,6 +283,24 @@ class GraphClient:
             url = str(next_url) if next_url else ""
         return children
 
+    def list_item_children(self, item_id: str, drive_base: str | None = None) -> list[dict[str, Any]]:
+        """List a known folder by DriveItem ID to avoid fragile path addressing."""
+        drive_base = drive_base or self.drive_base
+        safe_id = quote(item_id.strip(), safe="")
+        if not safe_id:
+            raise ValueError("DriveItem id cannot be empty")
+        url = f"{drive_base}/items/{safe_id}/children?$select=id,name,file,folder,parentReference,webUrl"
+        children: list[dict[str, Any]] = []
+        while url:
+            payload = self._request("GET", url).json()
+            values = payload.get("value", [])
+            if not isinstance(values, list):
+                raise RuntimeError("Microsoft Graph returned an invalid folder listing")
+            children.extend(item for item in values if isinstance(item, dict))
+            next_url = payload.get("@odata.nextLink")
+            url = str(next_url) if next_url else ""
+        return children
+
     def search_items(self, query: str, drive_base: str | None = None) -> list[dict[str, Any]]:
         """Search the selected OneDrive/SharePoint drive, following Graph pages.
 
@@ -318,9 +355,11 @@ class GraphClient:
             url = f"{drive_base}/root:/{parent}:/children" if current else f"{drive_base}/root/children"
             try:
                 self._request("POST", url, json={"name": segment, "folder": {}, "@microsoft.graph.conflictBehavior": "fail"})
-            except RuntimeError:
-                # 409 is expected when an earlier request already created the folder.
-                pass
+            except RuntimeError as exc:
+                # Only an existing-name conflict is expected. Do not hide
+                # permission, network, or server failures as if the folder existed.
+                if "Microsoft Graph request failed (409" not in str(exc):
+                    raise
             current = f"{current}/{segment}" if current else segment
 
     def upload_pdf(self, path: str, content: bytes, drive_base: str | None = None, ensure_parent: bool = True) -> dict[str, Any]:

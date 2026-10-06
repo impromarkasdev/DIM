@@ -291,51 +291,68 @@ def _container_paths(graph: GraphClient, entry: DimIndexRow, settings: Settings,
     base itself after the year folders makes those imports first-class without
     weakening the match to an unrelated declaration.
     """
-    parents = [f"{settings.dim_base_path}/{year}" for year in [entry.year] + [year for year in _years(settings) if year != entry.year]]
-    parents.append(settings.dim_base_path)
+    # Most entries are in the year shown by Excel. Check that folder and the
+    # root-level legacy location first. Only fan out across other years when
+    # neither contains the shipment.
+    parents = [f"{settings.dim_base_path}/{entry.year}", settings.dim_base_path]
     found: list[str] = []
     seen: set[str] = set()
-    for parent in parents:
+    def inspect(parent: str) -> None:
         if parent in seen:
-            continue
+            return
         seen.add(parent)
         try:
             items = graph.list_children(parent)
         except Exception as exc:
             diagnostics.append(f"No se pudo listar: {parent.rsplit('/', 1)[-1]}")
             logger.warning("DIM %s: no se pudo listar %s: %s", entry.reference, parent, exc)
-            continue
+            return
         matches = [item for item in items if item.get("folder") is not None and _shipment_matches(str(item.get("name", "")), entry.shipment)]
         for item in matches:
             path = f"{parent}/{item['name']}"
             if path not in found:
                 found.append(path)
                 diagnostics.append(f"Contenedor encontrado: {item['name']}")
+
+    for parent in parents:
+        inspect(parent)
+    if not found:
+        for year in _years(settings):
+            if year != entry.year:
+                inspect(f"{settings.dim_base_path}/{year}")
     return found
 
 
 def _walk_container(graph: GraphClient, container_path: str, diagnostics: list[str], max_depth: int = 6) -> list[tuple[str, list[dict[str, Any]]]]:
-    """Return all accessible folder listings in priority-aware breadth-first order."""
-    priority = [f"{container_path}/Procesados", f"{container_path}/DIM/Procesados", f"{container_path}/DIM", container_path]
-    queue: list[tuple[str, int]] = [(path, path.count("/") - container_path.count("/")) for path in priority]
+    """List only folders that actually exist, prioritizing Procesados then DIM."""
+    queue: list[tuple[str, int, int, str | None]] = [(container_path, 0, 0, None)]
     listings: list[tuple[str, list[dict[str, Any]]]] = []
     visited: set[str] = set()
     while queue:
-        path, depth = queue.pop(0)
+        queue.sort(key=lambda entry: (entry[2], entry[1]))
+        path, depth, _priority, item_id = queue.pop(0)
         if path in visited or depth > max_depth:
             continue
         visited.add(path)
         try:
-            items = graph.list_children(path)
+            # Resolve the top-level container by path once; descend using stable
+            # DriveItem IDs so names with &, accents or SharePoint path quirks
+            # cannot make the first lookup fail intermittently.
+            items = graph.list_item_children(item_id) if item_id else graph.list_children(path)
         except Exception:
             logger.info("DIM: carpeta no disponible %s", path)
             continue
         listings.append((path, items))
         for item in items:
             if item.get("folder") is not None:
-                if str(item.get("name", "")).casefold() in {"enviados", "redactados"}:
+                folder_name = str(item.get("name", ""))
+                if folder_name.casefold() in {"enviados", "redactados"}:
                     continue
-                queue.append((f"{path}/{item['name']}", depth + 1))
+                folded = folder_name.casefold()
+                priority = 0 if folded == "procesados" else 1 if folded == "dim" else 2
+                child_id = str(item.get("id", "")).strip() or None
+                if child_id:
+                    queue.append((f"{path}/{folder_name}", depth + 1, priority, child_id))
     diagnostics.append(f"Se exploraron {len(listings)} carpetas del contenedor")
     return listings
 
@@ -358,7 +375,7 @@ def _download_hierarchical_pdf(graph: GraphClient, entry: DimIndexRow, settings:
         direct = _find_pdf(items, entry.form_number)
         if direct:
             diagnostics.append("PDF individual encontrado en carpeta del contenedor")
-            return LocatedPdf(graph.download_path(f"{path}/{direct['name']}"), str(direct["name"]), path, graph.drive_base)
+            return LocatedPdf(graph.download_item(direct), str(direct["name"]), path, _item_drive_base(graph, direct))
 
     # The form number is the strongest key in Excel. Search the whole selected
     # drive before concluding that a missing folder or /Procesados means 404.
@@ -384,7 +401,7 @@ def _download_hierarchical_pdf(graph: GraphClient, entry: DimIndexRow, settings:
             direct = _find_pdf(items, entry.form_number)
             if direct:
                 diagnostics.append("PDF individual encontrado dentro del contenedor localizado globalmente")
-                return LocatedPdf(graph.download_path(f"{path}/{direct['name']}"), str(direct["name"]), path, graph.drive_base)
+                return LocatedPdf(graph.download_item(direct), str(direct["name"]), path, _item_drive_base(graph, direct))
 
     # Graph's drive search can also match PDF contents. Verify candidate PDFs
     # directly so an oddly named consolidated file can still be located even
@@ -407,8 +424,8 @@ def _download_hierarchical_pdf(graph: GraphClient, entry: DimIndexRow, settings:
         consolidated = _find_consolidated(items)
         if consolidated:
             diagnostics.append("PDF individual ausente; se usó DIM consolidado")
-            extracted = _extract_declaration(graph.download_path(f"{path}/{consolidated['name']}"), entry.form_number)
-            return LocatedPdf(extracted, f"{entry.form_number.lstrip('_')}.pdf", path, graph.drive_base, True)
+            extracted = _extract_declaration(graph.download_item(consolidated), entry.form_number)
+            return LocatedPdf(extracted, f"{entry.form_number.lstrip('_')}.pdf", path, _item_drive_base(graph, consolidated), True)
 
     # Last resort: search all indexed consolidated DIMs and verify actual page
     # text. The candidate list is deliberately bounded for serverless latency.
@@ -446,7 +463,24 @@ def process_hierarchical_references(references: list[str], supplied_terms: list[
             continue
         diagnostics.append(f"Referencia encontrada en hoja {entry.year}")
         try:
-            located = _download_hierarchical_pdf(graph, entry, settings, diagnostics)
+            located: LocatedPdf | None = None
+            for lookup_attempt in range(2):
+                try:
+                    located = _download_hierarchical_pdf(graph, entry, settings, diagnostics)
+                    break
+                except RuntimeError:
+                    # Folder listing/search code deliberately tolerates an
+                    # individual inaccessible location. If all candidates miss
+                    # after Graph reported a transient failure, repeat the
+                    # hierarchy once within this request instead of asking the
+                    # Wix user to click Search a second time.
+                    if lookup_attempt > 0 or not graph.had_transient_failure:
+                        raise
+                    graph.had_transient_failure = False
+                    diagnostics.append("Se reintentó la búsqueda por una respuesta temporal de SharePoint")
+                    logger.warning("DIM %s: retrying lookup after a transient Graph failure", reference)
+            if located is None:
+                raise RuntimeError("No fue posible resolver el archivo de la declaración")
             sanitized = redact_pdf(located.content, terms)
             file_name = _form_pdf_name(entry.form_number, located.file_name, located.content)
             source_folder = located.parent_folder

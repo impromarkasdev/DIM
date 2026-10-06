@@ -135,6 +135,100 @@ def _find_consolidated(items: list[dict[str, Any]]) -> dict[str, Any] | None:
     return next((item for item in items if item.get("file") is not None and str(item.get("name", "")).casefold().endswith(".pdf") and "dimconlevante" in _plain(str(item.get("name", "")))), None)
 
 
+def _item_parent_path(item: dict[str, Any]) -> str:
+    return GraphClient._parent_path(item.get("parentReference", {}))
+
+
+def _item_drive_base(graph: GraphClient, item: dict[str, Any]) -> str:
+    drive_id = str(item.get("parentReference", {}).get("driveId", ""))
+    return f"{graph.base}/drives/{drive_id}" if drive_id else graph.drive_base
+
+
+def _is_pdf(item: dict[str, Any]) -> bool:
+    return item.get("file") is not None and str(item.get("name", "")).casefold().endswith(".pdf")
+
+
+def _safe_graph_search(graph: GraphClient, query: str) -> list[dict[str, Any]]:
+    try:
+        return graph.search_items(query)
+    except Exception as exc:
+        # Search is an optimization/fallback. A missing search permission or
+        # transient search outage must not prevent normal path-based lookups.
+        logger.warning("DIM: búsqueda global de Graph falló para %r: %s", query, exc)
+        return []
+
+
+def _global_form_matches(graph: GraphClient, form_number: str) -> list[dict[str, Any]]:
+    """Find individually named declaration PDFs anywhere in the selected drive."""
+    digits = "".join(re.findall(r"\d", form_number))
+    matches: dict[str, dict[str, Any]] = {}
+    # Graph search may normalize punctuation; validate each result against the
+    # canonical form number locally to avoid confusing similar declarations.
+    for query in (form_number.strip().lstrip("_"), digits):
+        if not query:
+            continue
+        for item in _safe_graph_search(graph, query):
+            if not _is_pdf(item) or str(item.get("name", "")).casefold().startswith("redactada_"):
+                continue
+            name_key = _form_key(str(item.get("name", "")).rsplit(".", 1)[0])
+            if name_key == _form_key(form_number):
+                matches[str(item.get("id", item.get("name", "")))] = item
+    return list(matches.values())
+
+
+def _global_pdf_content_candidates(graph: GraphClient, form_number: str, limit: int = 12) -> list[dict[str, Any]]:
+    """Return indexed PDF hits for the form number, including consolidated files.
+
+    Microsoft Graph search can match file content as well as names. We verify
+    candidates by opening their PDF text, and cap the downloads for serverless
+    execution time and memory safety.
+    """
+    digits = "".join(re.findall(r"\d", form_number))
+    candidates: dict[str, dict[str, Any]] = {}
+    for query in (form_number.strip().lstrip("_"), digits):
+        for item in _safe_graph_search(graph, query):
+            if not _is_pdf(item) or str(item.get("name", "")).casefold().startswith("redactada_"):
+                continue
+            candidates[str(item.get("id", item.get("name", "")))] = item
+    # Likely consolidated DIM names first. Exact declaration filenames are
+    # handled separately and don't need another download attempt.
+    ordered = sorted(
+        candidates.values(),
+        key=lambda item: ("dim" not in _plain(str(item.get("name", ""))), int(item.get("size", 0) or 0)),
+    )
+    return ordered[:limit]
+
+
+def _global_container_paths(graph: GraphClient, shipment: str) -> list[str]:
+    """Find shipment folders regardless of year or configured base directory."""
+    queries = [shipment.strip()]
+    container = re.search(r"\bcont(?:enedor)?\.?\s*(\d+)\b", shipment, re.IGNORECASE)
+    if container:
+        queries.append(f"Contenedor {container.group(1)}")
+    paths: dict[str, None] = {}
+    for query in queries:
+        for item in _safe_graph_search(graph, query):
+            if item.get("folder") is None or not _shipment_matches(str(item.get("name", "")), shipment):
+                continue
+            parent = _item_parent_path(item)
+            path = f"{parent}/{item['name']}" if parent else str(item["name"])
+            paths[path] = None
+    return list(paths)
+
+
+def _global_consolidated_items(graph: GraphClient, shipment: str) -> list[dict[str, Any]]:
+    candidates: dict[str, dict[str, Any]] = {}
+    for item in _safe_graph_search(graph, "DIM CON LEVANTE"):
+        if not _is_pdf(item) or "dimconlevante" not in _plain(str(item.get("name", ""))):
+            continue
+        segments = _item_parent_path(item).split("/")
+        # Keep shipment-matching candidates first and a small bounded fallback
+        # in case both the year and the folder naming convention have changed.
+        if any(_shipment_matches(segment, shipment) for segment in segments) or len(candidates) < 25:
+            candidates[str(item.get("id", item.get("name", "")))] = item
+    return list(candidates.values())
+
+
 def _extract_declaration(pdf_bytes: bytes, form_number: str) -> bytes:
     target = _form_key(form_number)
     if not target:
@@ -227,22 +321,84 @@ def _download_hierarchical_pdf(graph: GraphClient, entry: DimIndexRow, settings:
     containers = _container_paths(graph, entry, settings, diagnostics)
     if not containers:
         diagnostics.append("Sin contenedor coincidente en carpetas anuales ni raíz")
+
+    # Search every known shipment folder before falling back to any consolidated
+    # file. Missing /Procesados and /DIM directories are normal and are skipped.
+    all_listings: list[tuple[str, list[dict[str, Any]]]] = []
     for container_path in containers:
         logger.info("DIM %s: explorando contenedor %s", entry.reference, container_path)
-        listings = _walk_container(graph, container_path, diagnostics)
-        # Prefer a generated /Procesados PDF, but accept an exact matching PDF
-        # from any nested location in the container before falling back.
-        for path, items in listings:
+        all_listings.extend(_walk_container(graph, container_path, diagnostics))
+
+    # The listing order gives /Procesados precedence, followed by the rest of
+    # the container tree (including DIM/ and any arbitrary subfolder).
+    for path, items in all_listings:
+        direct = _find_pdf(items, entry.form_number)
+        if direct:
+            diagnostics.append("PDF individual encontrado en carpeta del contenedor")
+            return LocatedPdf(graph.download_path(f"{path}/{direct['name']}"), str(direct["name"]), path, graph.drive_base)
+
+    # The form number is the strongest key in Excel. Search the whole selected
+    # drive before concluding that a missing folder or /Procesados means 404.
+    logger.info("DIM %s: buscando formulario %s en todo el drive", entry.reference, entry.form_number)
+    for direct in _global_form_matches(graph, entry.form_number):
+        parent = _item_parent_path(direct)
+        diagnostics.append("PDF individual encontrado mediante búsqueda global del drive")
+        return LocatedPdf(
+            graph.download_item(direct), str(direct.get("name", "documento.pdf")), parent,
+            _item_drive_base(graph, direct),
+        )
+
+    # Folder names can move between year directories or the configured base.
+    # Graph search locates shipment folder candidates independently of either.
+    known_paths = set(containers)
+    for container_path in _global_container_paths(graph, entry.shipment):
+        if container_path in known_paths:
+            continue
+        logger.info("DIM %s: explorando contenedor localizado globalmente %s", entry.reference, container_path)
+        global_listings = _walk_container(graph, container_path, diagnostics)
+        all_listings.extend(global_listings)
+        for path, items in global_listings:
             direct = _find_pdf(items, entry.form_number)
             if direct:
-                diagnostics.append("PDF individual encontrado")
+                diagnostics.append("PDF individual encontrado dentro del contenedor localizado globalmente")
                 return LocatedPdf(graph.download_path(f"{path}/{direct['name']}"), str(direct["name"]), path, graph.drive_base)
-        for path, items in listings:
-            consolidated = _find_consolidated(items)
-            if consolidated:
-                diagnostics.append("PDF individual ausente; se usó DIM consolidado")
-                extracted = _extract_declaration(graph.download_path(f"{path}/{consolidated['name']}"), entry.form_number)
-                return LocatedPdf(extracted, f"{entry.form_number.lstrip('_')}.pdf", path, graph.drive_base, True)
+
+    # Graph's drive search can also match PDF contents. Verify candidate PDFs
+    # directly so an oddly named consolidated file can still be located even
+    # when its year/container folders have been moved or renamed.
+    for candidate in _global_pdf_content_candidates(graph, entry.form_number):
+        name = str(candidate.get("name", "documento.pdf"))
+        try:
+            extracted = _extract_declaration(graph.download_item(candidate), entry.form_number)
+        except RuntimeError as exc:
+            logger.info("DIM %s: búsqueda por contenido descarta %s: %s", entry.reference, name, exc)
+            continue
+        diagnostics.append("Declaración localizada por contenido del PDF en búsqueda global")
+        return LocatedPdf(
+            extracted, f"{entry.form_number.lstrip('_')}.pdf", _item_parent_path(candidate),
+            _item_drive_base(graph, candidate), True,
+        )
+
+    # Only after all individual PDFs have been checked, use a consolidated DIM.
+    for path, items in all_listings:
+        consolidated = _find_consolidated(items)
+        if consolidated:
+            diagnostics.append("PDF individual ausente; se usó DIM consolidado")
+            extracted = _extract_declaration(graph.download_path(f"{path}/{consolidated['name']}"), entry.form_number)
+            return LocatedPdf(extracted, f"{entry.form_number.lstrip('_')}.pdf", path, graph.drive_base, True)
+
+    # Last resort: search all indexed consolidated DIMs and verify actual page
+    # text. The candidate list is deliberately bounded for serverless latency.
+    for consolidated in _global_consolidated_items(graph, entry.shipment):
+        name = str(consolidated.get("name", "DIM CON LEVANTE.pdf"))
+        parent = _item_parent_path(consolidated)
+        try:
+            extracted = _extract_declaration(graph.download_item(consolidated), entry.form_number)
+        except RuntimeError as exc:
+            logger.info("DIM %s: se omite consolidado global %s: %s", entry.reference, name, exc)
+            continue
+        diagnostics.append("Declaración extraída del DIM consolidado mediante búsqueda global")
+        return LocatedPdf(extracted, f"{entry.form_number.lstrip('_')}.pdf", parent, _item_drive_base(graph, consolidated), True)
     raise RuntimeError("No se encontró el contenedor o la declaración indicada en SharePoint")
 
 

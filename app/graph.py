@@ -250,6 +250,52 @@ class GraphClient:
             url = str(next_url) if next_url else ""
         return children
 
+    def search_items(self, query: str, drive_base: str | None = None) -> list[dict[str, Any]]:
+        """Search the selected OneDrive/SharePoint drive, following Graph pages.
+
+        This is a drive-wide indexed search, not a recursive crawl. Callers must
+        still validate returned names/paths against authoritative Excel data.
+        """
+        drive_base = drive_base or self.drive_base
+        query = query.strip()
+        if not query:
+            return []
+        encoded_query = quote(query, safe="")
+        url = (
+            f"{drive_base}/root/search(q='{encoded_query}')"
+            "?$select=id,name,file,folder,parentReference,webUrl,size"
+        )
+        results: list[dict[str, Any]] = []
+        seen: set[str] = set()
+        while url:
+            payload = self._request("GET", url).json()
+            values = payload.get("value", [])
+            if not isinstance(values, list):
+                raise RuntimeError("Microsoft Graph returned an invalid search result")
+            for item in values:
+                if not isinstance(item, dict):
+                    continue
+                item_id = str(item.get("id", ""))
+                key = item_id or f"{item.get('name', '')}:{item.get('webUrl', '')}"
+                if key not in seen:
+                    seen.add(key)
+                    results.append(item)
+            next_url = payload.get("@odata.nextLink")
+            url = str(next_url) if next_url else ""
+        logger.info("Graph drive search returned %s items for query %r", len(results), query)
+        return results
+
+    def download_item(self, item: dict[str, Any], drive_base: str | None = None) -> bytes:
+        """Download a search/list result by DriveItem ID, avoiding path ambiguity."""
+        item_id = str(item.get("id", "")).strip()
+        if not item_id:
+            raise ValueError("Graph DriveItem has no id")
+        item_drive = str(item.get("parentReference", {}).get("driveId", ""))
+        selected_drive = f"{self.base}/drives/{quote(item_drive, safe='')}" if item_drive else (drive_base or self.drive_base)
+        return self._request(
+            "GET", f"{selected_drive}/items/{quote(item_id, safe='')}/content"
+        ).content
+
     def ensure_folder(self, folder: str, drive_base: str | None = None) -> None:
         drive_base = drive_base or self.drive_base
         current = ""

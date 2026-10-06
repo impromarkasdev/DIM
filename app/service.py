@@ -52,13 +52,36 @@ def _form_key(value: str) -> str:
     return "".join(re.findall(r"[a-z0-9]+", value.casefold()))
 
 
-def _form_pdf_name(form_number: str) -> str:
-    """Return the canonical DIAN Campo 4 filename, preserving leading zeroes."""
+def _form_pdf_name(form_number: str, source_name: str = "", pdf_bytes: bytes = b"") -> str:
+    """Return the full DIAN Campo 4 name, recovering the check digit if Excel omits it."""
     normalized = re.sub(r"\s+", "", form_number.strip().lstrip("_"))
     match = re.fullmatch(r"(\d{15})[-‐‑‒–—−](\d)", normalized)
-    if not match:
-        raise ValueError("El número de formulario del Excel no tiene el formato DIAN esperado")
-    return f"{match.group(1)}-{match.group(2)}.pdf"
+    if match:
+        return f"{match.group(1)}-{match.group(2)}.pdf"
+
+    # Some workbook cells contain the 15-digit base but omit Campo 4's
+    # verification digit. Prefer the matched source filename, then read the
+    # actual PDF text (including a declaration extracted from a consolidated).
+    digits_match = re.fullmatch(r"(\d{15})(?:\.0)?", normalized)
+    if digits_match:
+        expected_digits = digits_match.group(1)
+        candidates = [source_name]
+        if pdf_bytes:
+            try:
+                with fitz.open(stream=pdf_bytes, filetype="pdf") as document:
+                    candidates.extend(page.get_text("text") for page in document)
+            except Exception as exc:
+                logger.warning("No se pudo recuperar Campo 4 del PDF para nombrarlo: %s", exc)
+        for candidate in candidates:
+            compact = re.sub(r"\s+", "", candidate.lstrip("_"))
+            for found in FORM_NUMBER.finditer(compact):
+                found_digits = "".join(re.findall(r"\d", found.group(1)))
+                if found_digits == expected_digits:
+                    return f"{found_digits}-{found.group(2)}.pdf"
+
+    raise ValueError(
+        "El Excel no contiene el dígito verificador del Número de Formulario y no se pudo recuperar del PDF"
+    )
 
 
 def _years(settings: Settings) -> list[str]:
@@ -425,7 +448,7 @@ def process_hierarchical_references(references: list[str], supplied_terms: list[
         try:
             located = _download_hierarchical_pdf(graph, entry, settings, diagnostics)
             sanitized = redact_pdf(located.content, terms)
-            file_name = _form_pdf_name(entry.form_number)
+            file_name = _form_pdf_name(entry.form_number, located.file_name, located.content)
             source_folder = located.parent_folder
             if source_folder.endswith("/Procesados"):
                 source_folder = source_folder.rsplit("/", 1)[0]

@@ -65,13 +65,27 @@ class GraphClient:
                 return response
             except requests.RequestException as exc:
                 status = getattr(exc.response, "status_code", "unavailable")
-                if attempt < attempts and (exc.response is None or status == 429 or status >= 500):
+                # GETs are idempotent. A short retry for 409 handles transient
+                # SharePoint folder/index conflicts observed while enumerating
+                # a hierarchy, without retrying conflicting writes.
+                retryable = (
+                    exc.response is None or status == 429 or status >= 500
+                    or (status == 409 and method.upper() == "GET")
+                )
+                if attempt < attempts and retryable:
                     delay = float(attempt)
-                    logger.warning("Graph request failed (%s); retrying in %.1fs", status, delay)
+                    logger.warning("Graph request failed (HTTP %s); retrying in %.1fs", status, delay)
                     time.sleep(delay)
                     continue
-                logger.exception("Graph request failed permanently (HTTP %s)", status)
-                raise RuntimeError(f"Microsoft Graph request failed ({status})") from exc
+                graph_code = ""
+                if exc.response is not None:
+                    try:
+                        graph_code = str(exc.response.json().get("error", {}).get("code", ""))
+                    except (ValueError, AttributeError):
+                        pass
+                logger.error("Graph request failed permanently (HTTP %s, code %s)", status, graph_code or "unknown")
+                suffix = f", {graph_code}" if graph_code else ""
+                raise RuntimeError(f"Microsoft Graph request failed ({status}{suffix})") from exc
         raise RuntimeError("Microsoft Graph request failed after retries")
 
     @staticmethod

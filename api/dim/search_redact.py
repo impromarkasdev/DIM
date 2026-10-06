@@ -22,7 +22,21 @@ class handler(ApiHandler):
             result = process_hierarchical_references(references, sensitive_terms, Settings.from_env())
             successful = [item for item in result["resultados"] if item.get("estado") == "Exito"]
             if not successful:
-                self.respond(404, {"success": False, "message": "No matching PDF was found", "resultados": result["resultados"]})
+                failures = [item for item in result["resultados"] if item.get("estado") == "Error"]
+                if failures:
+                    first = failures[0]
+                    detail = str(first.get("detalle", "Error no especificado"))
+                    self.respond(502, {
+                        "success": False,
+                        "message": f"No fue posible procesar la referencia {first.get('referencia', '')}: {detail}",
+                        "resultados": result["resultados"],
+                    })
+                    return
+                self.respond(404, {
+                    "success": False,
+                    "message": "No se encontró una declaración para las referencias ingresadas.",
+                    "resultados": result["resultados"],
+                })
                 return
             files = [{"fileName": item["nombre_pdf"], "downloadUrl": item["downloadUrl"], "outputFolder": item["outputFolder"]} for item in successful]
             self.respond(200, {"success": True, "downloadUrl": files[0]["downloadUrl"], "fileName": files[0]["fileName"], "files": files, "resultados": result["resultados"]})

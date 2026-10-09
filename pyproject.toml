@@ -22,4 +22,4 @@ dependencies = [
 entrypoint = "api.index:handler"
 
 [[tool.vercel.subscribers]]
-entrypoint = "app.queue_worker"
+entrypoint = "app.queue_worker:process_dim_reference"

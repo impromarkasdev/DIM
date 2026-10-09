@@ -6,6 +6,8 @@ from app.graph import GraphClient
 from app.security import create_jwt, decode_jwt
 from app.service import _safe_graph_search
 from api.admin.users import handler as UsersHandler
+from app.queue_worker import process_dim_reference
+from vercel.queue import get_subscriptions
 
 
 class GraphSearchTests(unittest.TestCase):
@@ -65,6 +67,17 @@ class SecurityTests(unittest.TestCase):
         self.assertTrue(UsersHandler._parse_active("true"))
         with self.assertRaises(ValueError):
             UsersHandler._parse_active("False maybe")
+
+
+class QueueConfigurationTests(unittest.TestCase):
+    def test_worker_entrypoint_registers_expected_queue_subscription(self) -> None:
+        subscriptions = get_subscriptions()
+        worker_subscriptions = [
+            subscription for subscription in subscriptions
+            if subscription.func is process_dim_reference
+        ]
+        self.assertEqual(len(worker_subscriptions), 1)
+        self.assertEqual(worker_subscriptions[0].topic, "dim-redaction")
 
 
 if __name__ == "__main__":

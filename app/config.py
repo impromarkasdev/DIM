@@ -32,6 +32,8 @@ class Settings:
     dim_base_path: str
     webhook_secret: str
     cron_secret: str
+    document_intelligence_endpoint: str
+    document_intelligence_key: str
 
     @classmethod
     def from_env(cls) -> "Settings":
@@ -83,4 +85,6 @@ class Settings:
             **indexes,
             webhook_secret=os.getenv("WEBHOOK_SECRET", ""),
             cron_secret=os.getenv("CRON_SECRET", ""),
+            document_intelligence_endpoint=os.getenv("AZURE_DOCUMENT_INTELLIGENCE_ENDPOINT", "").strip().rstrip("/"),
+            document_intelligence_key=os.getenv("AZURE_DOCUMENT_INTELLIGENCE_KEY", "").strip(),
         )

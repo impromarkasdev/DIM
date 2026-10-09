@@ -1,49 +1,78 @@
 from __future__ import annotations
 
 import logging
+import re
 
-from app.http_api import ApiHandler
-from app.config import Settings
-from app.service import process_hierarchical_references
+from app.http_api import ApiHandler, AuthenticationError
+from app.jobs import create_job, enqueue_job, get_job
 
 logger = logging.getLogger(__name__)
+MAX_REFERENCES_PER_JOB = 30
 
 
 class handler(ApiHandler):
     def do_POST(self) -> None:
         try:
-            self.claims()
+            claims = self.claims()
+            owner_email = str(claims.get("sub", "")).strip().lower()
+            if not owner_email or "@" not in owner_email:
+                self.respond(401, {"success": False, "message": "La sesión no contiene un usuario válido."})
+                return
+
             body = self.json_body()
             references = body.get("references", body.get("referencias"))
-            if isinstance(references, str): references = [references]
-            if not isinstance(references, list): raise ValueError("references must be a string or array")
+            if isinstance(references, str):
+                references = [references]
+            if (
+                not isinstance(references, list)
+                or not references
+                or len(references) > MAX_REFERENCES_PER_JOB
+                or not all(isinstance(value, str) and value.strip() and len(value.strip()) <= 200 for value in references)
+            ):
+                raise ValueError(f"references debe contener entre 1 y {MAX_REFERENCES_PER_JOB} referencias válidas")
+
             sensitive_terms = body.get("datosSensibles", [])
-            if not isinstance(sensitive_terms, list): raise ValueError("datosSensibles must be an array of strings")
-            result = process_hierarchical_references(references, sensitive_terms, Settings.from_env())
-            successful = [item for item in result["resultados"] if item.get("estado") == "Exito"]
-            if not successful:
-                failures = [item for item in result["resultados"] if item.get("estado") == "Error"]
-                if failures:
-                    first = failures[0]
-                    detail = str(first.get("detalle", "Error no especificado"))
-                    self.respond(502, {
-                        "success": False,
-                        "message": f"No fue posible procesar la referencia {first.get('referencia', '')}: {detail}",
-                        "resultados": result["resultados"],
-                    })
-                    return
-                self.respond(404, {
-                    "success": False,
-                    "message": "No se encontró una declaración para las referencias ingresadas.",
-                    "resultados": result["resultados"],
-                })
-                return
-            files = [{"fileName": item["nombre_pdf"], "downloadUrl": item["downloadUrl"], "outputFolder": item["outputFolder"]} for item in successful]
-            self.respond(200, {"success": True, "downloadUrl": files[0]["downloadUrl"], "fileName": files[0]["fileName"], "files": files, "resultados": result["resultados"]})
+            if (
+                not isinstance(sensitive_terms, list)
+                or len(sensitive_terms) > 100
+                or not all(isinstance(value, str) and len(value) <= 500 for value in sensitive_terms)
+            ):
+                raise ValueError("datosSensibles debe ser una lista válida de textos")
+
+            normalized_references = [value.strip() for value in references]
+            normalized_terms = [value.strip() for value in sensitive_terms if value.strip()]
+            idempotency_key = self.headers.get("Idempotency-Key", "").strip() or None
+            if idempotency_key and (len(idempotency_key) > 128 or not re.fullmatch(r"[A-Za-z0-9._:-]+", idempotency_key)):
+                raise ValueError("Idempotency-Key no tiene un formato válido")
+
+            job_id, created = create_job(
+                owner_email, normalized_references, normalized_terms, idempotency_key
+            )
+            # Re-publishing queued items is safe: every message has a stable
+            # Vercel Queue idempotency key derived from the persisted job/item.
+            enqueue_job(job_id)
+            job = get_job(job_id, owner_email)
+            if not job:
+                raise RuntimeError("No fue posible recuperar el trabajo recién creado")
+            self.respond(202, {
+                "success": True,
+                "jobId": job_id,
+                "status": job["status"],
+                "total": job["total"],
+                "completed": job["completed"],
+                "statusUrl": f"/api/documents/jobs?jobId={job_id}",
+                "created": created,
+                "message": "Solicitud recibida para procesamiento seguro.",
+            })
+        except AuthenticationError:
+            self.respond(401, {"success": False, "message": "La sesión no es válida o expiró."})
         except PermissionError:
-            self.respond(401, {"success": False, "message": "Invalid or expired session"})
+            self.respond(401, {"success": False, "message": "La sesión no es válida o expiró."})
         except ValueError as exc:
             self.respond(400, {"success": False, "message": str(exc)})
-        except Exception as exc:
-            logger.exception("Unexpected DIM search/redaction error")
-            self.respond(500, {"success": False, "message": f"Search and redaction failed: {exc}"})
+        except Exception:
+            logger.exception("Could not submit DIM redaction job")
+            self.respond(503, {
+                "success": False,
+                "message": "No fue posible poner la solicitud en la cola. Inténtalo nuevamente.",
+            })

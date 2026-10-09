@@ -6,6 +6,11 @@ from http.server import BaseHTTPRequestHandler
 from typing import Any
 
 from .security import decode_jwt
+from .users import session_is_active
+
+
+class AuthenticationError(ValueError):
+    """Credentials are missing, invalid, expired, revoked, or no longer active."""
 
 
 class ApiHandler(BaseHTTPRequestHandler):
@@ -20,7 +25,7 @@ class ApiHandler(BaseHTTPRequestHandler):
         origin = self._origin()
         if origin:
             self.send_header("Access-Control-Allow-Origin", origin); self.send_header("Vary", "Origin")
-        self.send_header("Access-Control-Allow-Headers", "Authorization, Content-Type")
+        self.send_header("Access-Control-Allow-Headers", "Authorization, Content-Type, Idempotency-Key")
         self.send_header("Access-Control-Allow-Methods", "GET, POST, DELETE, OPTIONS")
         self.send_header("Content-Length", str(len(body))); self.end_headers(); self.wfile.write(body)
 
@@ -35,7 +40,15 @@ class ApiHandler(BaseHTTPRequestHandler):
         self.send_header("Content-Length", str(len(content))); self.end_headers(); self.wfile.write(content)
 
     def do_OPTIONS(self) -> None:
-        self.respond(204, {})
+        self.send_response(204)
+        origin = self._origin()
+        if origin:
+            self.send_header("Access-Control-Allow-Origin", origin)
+            self.send_header("Vary", "Origin")
+        self.send_header("Access-Control-Allow-Headers", "Authorization, Content-Type, Idempotency-Key")
+        self.send_header("Access-Control-Allow-Methods", "GET, POST, DELETE, OPTIONS")
+        self.send_header("Content-Length", "0")
+        self.end_headers()
 
     def json_body(self) -> dict[str, Any]:
         length = int(self.headers.get("Content-Length", "0"))
@@ -46,7 +59,17 @@ class ApiHandler(BaseHTTPRequestHandler):
         return data
 
     def claims(self, admin: bool = False) -> dict[str, Any]:
-        token = self.headers.get("Authorization", "").removeprefix("Bearer ")
-        claims = decode_jwt(token, os.getenv("JWT_SECRET", ""))
+        authorization = self.headers.get("Authorization", "")
+        scheme, separator, token = authorization.partition(" ")
+        if not separator or scheme.casefold() != "bearer" or not token.strip():
+            raise AuthenticationError("Invalid or expired token")
+        try:
+            claims = decode_jwt(token.strip(), os.getenv("JWT_SECRET", ""))
+        except ValueError as exc:
+            raise AuthenticationError("Invalid or expired token") from exc
+        email = str(claims.get("sub", "")).strip().lower()
+        role = str(claims.get("role", ""))
+        if not email or "@" not in email or not session_is_active(email, role):
+            raise AuthenticationError("Invalid or expired token")
         if admin and claims.get("role") != "admin": raise PermissionError("Administrator access required")
         return claims

@@ -2,10 +2,11 @@ from __future__ import annotations
 
 import io
 import logging
-import os
 import re
 from collections import OrderedDict
 import fitz
+
+from .ocr import recognize_campo4_pages
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
@@ -42,41 +43,32 @@ def _find_form_number(text: str) -> str | None:
     return f"{digits}-{match.group(2)}" if len(digits) == 15 else None
 
 
-def _ocr_page_text(page: fitz.Page, page_number: int) -> str:
-    """OCR a rendered page when its selectable text has no Campo 4 match."""
-    try:
-        import pytesseract
-        from PIL import Image
-    except ImportError as exc:
-        raise RuntimeError("OCR requerido pero faltan pytesseract/Pillow; instálelos junto con el binario Tesseract") from exc
-    try:
-        tesseract_cmd = os.getenv("TESSERACT_CMD", "").strip()
-        if tesseract_cmd:
-            pytesseract.pytesseract.tesseract_cmd = tesseract_cmd
-        pixmap = page.get_pixmap(dpi=250, alpha=False)
-        image = Image.open(io.BytesIO(pixmap.tobytes("png")))
-        logger.info("PDF split: OCR started on page %s", page_number)
-        text = pytesseract.image_to_string(image, config="--oem 1 --psm 6")
-        logger.info("PDF split: OCR completed on page %s (%s characters)", page_number, len(text))
-        return text
-    except pytesseract.TesseractNotFoundError as exc:
-        raise RuntimeError("OCR requerido pero el ejecutable Tesseract no está instalado/configurado") from exc
-    except Exception as exc:
-        logger.exception("PDF split: OCR failed on page %s", page_number)
-        raise RuntimeError(f"OCR failed on page {page_number}") from exc
-
-
 def split_declarations_with_report(pdf_bytes: bytes) -> tuple[list[tuple[str, bytes]], list[int]]:
     try:
         with fitz.open(stream=pdf_bytes, filetype="pdf") as source:
             page_texts = [page.get_text("text") for page in source]
+            blank_pages = [_is_blank(page) for page in source]
+            ocr_page_indexes = [
+                index for index, text in enumerate(page_texts)
+                if not blank_pages[index]
+                and _find_form_number(text) is None
+                and (len(re.sub(r"\s+", "", text)) < 40 or FIELD_4_LABEL.search(text))
+            ]
+            ocr_texts: dict[int, str] = {}
+            if ocr_page_indexes:
+                logger.info("PDF split: OCR fallback for %s pages", len(ocr_page_indexes))
+                try:
+                    ocr_texts = recognize_campo4_pages(source, ocr_page_indexes)
+                except Exception:
+                    logger.exception("PDF split: OCR fallback failed")
+                    raise
             # Keep source page indexes: fitz.Page objects are tied to the
             # document lifetime and cannot safely outlive this context.
             groups: OrderedDict[str, list[int]] = OrderedDict()
             current: str | None = None
             skipped_pages: list[int] = []
             for page_number, (page, text) in enumerate(zip(source, page_texts)):
-                if _is_blank(page):
+                if blank_pages[page_number]:
                     logger.info("PDF split: blank page %s skipped", page_number + 1)
                     continue
                 # Only a Campo 4 number starts a new declaration. All following
@@ -86,10 +78,9 @@ def split_declarations_with_report(pdf_bytes: bytes) -> tuple[list[tuple[str, by
                 # output document.
                 form_number = _find_form_number(text)
                 if form_number is None:
-                    compact_text = re.sub(r"\s+", "", text)
-                    if len(compact_text) < 40 or FIELD_4_LABEL.search(text):
-                        logger.info("PDF split: page %s has no usable Campo 4 text; trying OCR", page_number + 1)
-                        form_number = _find_form_number(_ocr_page_text(page, page_number + 1))
+                    if page_number in ocr_texts:
+                        logger.info("PDF split: page %s has no usable Campo 4 text; checking OCR result", page_number + 1)
+                        form_number = _find_form_number(ocr_texts[page_number])
                     else:
                         logger.info("PDF split: page %s has readable text but no Campo 4; treating as continuation", page_number + 1)
                 if form_number:

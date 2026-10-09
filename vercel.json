@@ -2,6 +2,15 @@
   "functions": {
     "api/index.py": {
       "maxDuration": 60
+    },
+    "app/queue_worker.py": {
+      "maxDuration": 300
     }
-  }
+  },
+  "crons": [
+    {
+      "path": "/api/cron/keep-alive",
+      "schedule": "0 0 * * 1"
+    }
+  ]
 }

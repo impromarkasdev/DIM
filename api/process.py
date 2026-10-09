@@ -33,7 +33,7 @@ class handler(BaseHTTPRequestHandler):
                 raise ValueError("JSON body must be an object or an array of references")
             settings = Settings.from_env()
             received_secret = self.headers.get("X-Webhook-Secret", "")
-            if settings.webhook_secret and not hmac.compare_digest(received_secret, settings.webhook_secret):
+            if not settings.webhook_secret or not hmac.compare_digest(received_secret, settings.webhook_secret):
                 self._respond(401, {"error": "Unauthorized webhook"})
                 return
             result = process_references(payload, settings)

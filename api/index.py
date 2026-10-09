@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import importlib
+import logging
 from http.server import BaseHTTPRequestHandler
 from urllib.parse import urlparse
 
@@ -14,9 +15,13 @@ ROUTES = {
     "/api/admin/split-pdf": "api.admin.split_pdf",
     "/api/documents/process-redact": "api.dim.search_redact",
     "/api/dim/search-and-redact": "api.dim.search_redact",
+    "/api/documents/jobs": "api.dim.jobs",
+    "/api/documents/download": "api.documents.download",
+    "/api/admin/jobs": "api.admin.jobs",
     "/api/cron/keep-alive": "api.cron.keep_alive",
     "/api/process": "api.process",
 }
+logger = logging.getLogger(__name__)
 
 
 class handler(ApiHandler):
@@ -38,8 +43,12 @@ class handler(ApiHandler):
                 self.respond(405, {"success": False, "message": "Method not allowed"})
                 return
             action(self)
-        except Exception as exc:
-            self.respond(500, {"success": False, "message": f"Route initialization failed: {type(exc).__name__}: {exc}"})
+        except Exception:
+            # Import traces and exception text can contain deployment paths,
+            # configuration details, or upstream responses. Keep them in
+            # server logs only; return a stable public error contract.
+            logger.exception("Route initialization or dispatch failed for %s", request_path)
+            self.respond(500, {"success": False, "message": "No fue posible inicializar este servicio."})
 
     def do_GET(self) -> None:
         self._dispatch("do_GET")

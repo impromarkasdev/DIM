@@ -17,7 +17,11 @@ from .pdf_splitter import FORM_NUMBER
 from .pdf_service import redact_pdf
 
 logger = logging.getLogger(__name__)
-REFERENCE_COLUMN, SHIPMENT_COLUMN, FORM_COLUMN = 41, 42, 43  # AP, AQ, AR (zero based)
+
+
+def _excel_columns(year: str) -> tuple[int, int, int]:
+    """Return zero-based (reference, shipment, form) columns for each sheet era."""
+    return (42, 43, 44) if int(year) >= 2024 else (41, 42, 43)
 
 
 @dataclass(frozen=True)
@@ -99,15 +103,22 @@ def _read_master_index(workbook: bytes, settings: Settings) -> dict[str, DimInde
         if frame is None:
             logger.info("DIM Excel: hoja %s no existe", year)
             continue
-        if frame.shape[1] <= FORM_COLUMN:
-            logger.warning("DIM Excel: hoja %s no contiene las columnas AP:AQ:AR", year)
+        reference_column, shipment_column, form_column = _excel_columns(year)
+        if frame.shape[1] <= form_column:
+            logger.warning("DIM Excel: hoja %s no contiene las columnas esperadas", year)
             continue
-        logger.info("DIM Excel: revisando hoja %s (%s filas)", year, len(frame.index))
-        for column in (REFERENCE_COLUMN, SHIPMENT_COLUMN, FORM_COLUMN):
+        logger.info(
+            "DIM Excel: revisando hoja %s (%s filas; columnas %s/%s/%s)",
+            year, len(frame.index), reference_column + 1, shipment_column + 1, form_column + 1,
+        )
+        for column in (reference_column, shipment_column, form_column):
             frame.iloc[:, column] = frame.iloc[:, column].astype(str).str.strip()
         sheet_matches = 0
         for _, row in frame.iterrows():
-            reference, shipment, form_number = (_cell_text(row.iloc[column]) for column in (REFERENCE_COLUMN, SHIPMENT_COLUMN, FORM_COLUMN))
+            reference, shipment, form_number = (
+                _cell_text(row.iloc[column])
+                for column in (reference_column, shipment_column, form_column)
+            )
             key = _plain(reference)
             if key and shipment and form_number and key not in indexed:
                 indexed[key] = DimIndexRow(reference, year, shipment, form_number)
@@ -175,10 +186,10 @@ def _safe_graph_search(graph: GraphClient, query: str) -> list[dict[str, Any]]:
     try:
         return graph.search_items(query)
     except Exception as exc:
-        # Search is an optimization/fallback. A missing search permission or
-        # transient search outage must not prevent normal path-based lookups.
-        logger.warning("DIM: búsqueda global de Graph falló para %r: %s", query, exc)
-        return []
+        # Do not turn an unavailable or incomplete global search into a false
+        # "not found" result. Let the job retry or report a service failure.
+        logger.warning("DIM: búsqueda global de Graph falló (%s)", type(exc).__name__)
+        raise
 
 
 def _global_form_matches(graph: GraphClient, form_number: str) -> list[dict[str, Any]]:
@@ -199,7 +210,7 @@ def _global_form_matches(graph: GraphClient, form_number: str) -> list[dict[str,
     return list(matches.values())
 
 
-def _global_pdf_content_candidates(graph: GraphClient, form_number: str, limit: int = 3) -> list[dict[str, Any]]:
+def _global_pdf_content_candidates(graph: GraphClient, form_number: str, limit: int = 10) -> list[dict[str, Any]]:
     """Return indexed PDF hits for the form number, including consolidated files.
 
     Microsoft Graph search can match file content as well as names. We verify
@@ -249,8 +260,6 @@ def _global_consolidated_items(graph: GraphClient, shipment: str) -> list[dict[s
         # in case both the year and the folder naming convention have changed.
         if any(_shipment_matches(segment, shipment) for segment in segments):
             candidates[str(item.get("id", item.get("name", "")))] = item
-            if len(candidates) >= 5:
-                break
     return list(candidates.values())
 
 
@@ -307,7 +316,7 @@ def _container_paths(graph: GraphClient, entry: DimIndexRow, settings: Settings,
             items = graph.list_children(parent)
         except Exception as exc:
             diagnostics.append(f"No se pudo listar: {parent.rsplit('/', 1)[-1]}")
-            logger.warning("DIM %s: no se pudo listar %s: %s", entry.reference, parent, exc)
+            logger.warning("DIM: no se pudo listar una carpeta candidata (%s)", type(exc).__name__)
             return
         matches = [item for item in items if item.get("folder") is not None and _shipment_matches(str(item.get("name", "")), entry.shipment)]
         for item in matches:
@@ -368,7 +377,7 @@ def _download_hierarchical_pdf(graph: GraphClient, entry: DimIndexRow, settings:
     # file. Missing /Procesados and /DIM directories are normal and are skipped.
     all_listings: list[tuple[str, list[dict[str, Any]]]] = []
     for container_path in containers:
-        logger.info("DIM %s: explorando contenedor %s", entry.reference, container_path)
+        logger.info("DIM: explorando contenedor candidato")
         all_listings.extend(_walk_container(graph, container_path, diagnostics))
 
     # The listing order gives /Procesados precedence, followed by the rest of
@@ -381,7 +390,7 @@ def _download_hierarchical_pdf(graph: GraphClient, entry: DimIndexRow, settings:
 
     # The form number is the strongest key in Excel. Search the whole selected
     # drive before concluding that a missing folder or /Procesados means 404.
-    logger.info("DIM %s: buscando formulario %s en todo el drive", entry.reference, entry.form_number)
+    logger.info("DIM: buscando formulario exacto en todo el drive")
     for direct in _global_form_matches(graph, entry.form_number):
         parent = _item_parent_path(direct)
         diagnostics.append("PDF individual encontrado mediante búsqueda global del drive")
@@ -396,7 +405,7 @@ def _download_hierarchical_pdf(graph: GraphClient, entry: DimIndexRow, settings:
     for container_path in _global_container_paths(graph, entry.shipment):
         if container_path in known_paths:
             continue
-        logger.info("DIM %s: explorando contenedor localizado globalmente %s", entry.reference, container_path)
+        logger.info("DIM: explorando contenedor localizado por búsqueda global")
         global_listings = _walk_container(graph, container_path, diagnostics)
         all_listings.extend(global_listings)
         for path, items in global_listings:
@@ -421,7 +430,7 @@ def _download_hierarchical_pdf(graph: GraphClient, entry: DimIndexRow, settings:
         try:
             extracted = _extract_declaration(graph.download_item(consolidated), entry.form_number)
         except RuntimeError as exc:
-            logger.info("DIM %s: se omite consolidado global %s: %s", entry.reference, name, exc)
+            logger.info("DIM: se omite consolidado candidato (%s)", type(exc).__name__)
             continue
         diagnostics.append("Declaración extraída del DIM consolidado mediante búsqueda global")
         return LocatedPdf(extracted, f"{entry.form_number.lstrip('_')}.pdf", parent, _item_drive_base(graph, consolidated), True)
@@ -434,7 +443,7 @@ def _download_hierarchical_pdf(graph: GraphClient, entry: DimIndexRow, settings:
         try:
             extracted = _extract_declaration(graph.download_item(candidate), entry.form_number)
         except RuntimeError as exc:
-            logger.info("DIM %s: búsqueda por contenido descarta %s: %s", entry.reference, name, exc)
+            logger.info("DIM: búsqueda por contenido descarta un PDF candidato (%s)", type(exc).__name__)
             continue
         diagnostics.append("Declaración localizada por contenido del PDF en búsqueda global")
         return LocatedPdf(
@@ -460,7 +469,7 @@ def process_hierarchical_references(references: list[str], supplied_terms: list[
         reference, diagnostics = raw_reference.strip(), ["Excel maestro descargado"]
         entry = index.get(_plain(reference))
         if not entry:
-            logger.info("DIM: referencia %s no encontrada en Excel", reference)
+            logger.info("DIM: referencia no encontrada en Excel")
             results.append({"referencia": reference, "estado": "Pendiente (No encontrado)", "diagnostico": diagnostics})
             continue
         diagnostics.append(f"Referencia encontrada en hoja {entry.year}")
@@ -480,7 +489,7 @@ def process_hierarchical_references(references: list[str], supplied_terms: list[
                         raise
                     graph.had_transient_failure = False
                     diagnostics.append("Se reintentó la búsqueda por una respuesta temporal de SharePoint")
-                    logger.warning("DIM %s: retrying lookup after a transient Graph failure", reference)
+                    logger.warning("DIM: repitiendo búsqueda tras un fallo temporal de Graph")
             if located is None:
                 raise RuntimeError("No fue posible resolver el archivo de la declaración")
             sanitized = redact_pdf(located.content, terms)
@@ -491,9 +500,29 @@ def process_hierarchical_references(references: list[str], supplied_terms: list[
             output_folder = f"{source_folder}/Enviados"
             metadata = graph.upload_pdf(f"{output_folder}/{file_name}", sanitized, located.drive_base)
             diagnostics.append("Redacción física aplicada y archivo subido")
-            results.append({"referencia": reference, "estado": "Exito", "nombre_pdf": file_name, "embarque": entry.shipment, "numeroFormulario": entry.form_number, "outputFolder": f"/{output_folder}", "downloadUrl": metadata.get("@microsoft.graph.downloadUrl", ""), "extraidoDeConsolidado": located.extracted_from_consolidated, "diagnostico": diagnostics})
+            if not metadata.get("id"):
+                raise RuntimeError("Microsoft Graph guardó el PDF sin devolver su identificador")
+            drive_reference = metadata.get("parentReference", {}).get("driveId")
+            stable_drive_base = (
+                f"{graph.base}/drives/{drive_reference}" if drive_reference else located.drive_base
+            )
+            results.append({
+                "referencia": reference,
+                "estado": "Exito",
+                "nombre_pdf": file_name,
+                "embarque": entry.shipment,
+                "numeroFormulario": entry.form_number,
+                "outputFolder": f"/{output_folder}",
+                "downloadFiles": [{
+                    "driveItemId": str(metadata["id"]),
+                    "driveBase": stable_drive_base,
+                    "name": file_name,
+                }],
+                "extraidoDeConsolidado": located.extracted_from_consolidated,
+                "diagnostico": diagnostics,
+            })
         except Exception as exc:
-            logger.exception("DIM: fallo procesando referencia %s", reference)
+            logger.exception("DIM: fallo procesando una referencia")
             results.append({"referencia": reference, "estado": "Error", "detalle": str(exc), "diagnostico": diagnostics})
     return {"resultados": results}
 

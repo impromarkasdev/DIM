@@ -21,6 +21,7 @@ class GraphClient:
     def __init__(self, settings: Settings) -> None:
         self.settings = settings
         self.had_transient_failure = False
+        self._ensured_folders: set[tuple[str, str]] = set()
         self.session = requests.Session()
         adapter = HTTPAdapter(pool_connections=10, pool_maxsize=10, max_retries=1)
         self.session.mount("https://", adapter)
@@ -62,6 +63,15 @@ class GraphClient:
         raise RuntimeError("Could not obtain Microsoft Graph access token")
 
     def _request(self, method: str, url: str, **kwargs: Any) -> requests.Response:
+        parsed_url = urlparse(url)
+        if (
+            parsed_url.scheme != "https"
+            or parsed_url.netloc.casefold() != "graph.microsoft.com"
+            or not parsed_url.path.startswith("/v1.0/")
+            or parsed_url.username
+            or parsed_url.password
+        ):
+            raise ValueError("Only Microsoft Graph v1.0 HTTPS URLs are allowed")
         headers = kwargs.pop("headers", {})
         headers["Authorization"] = f"Bearer {self.token}"
         attempts = 3
@@ -87,7 +97,7 @@ class GraphClient:
                 # a hierarchy, without retrying conflicting writes.
                 retryable = (
                     exc.response is None or status == 429 or status >= 500
-                    or (status == 409 and method.upper() in {"GET", "PUT"})
+                    or (status == 409 and method.upper() == "GET")
                 )
                 if attempt < attempts and retryable:
                     delay = float(attempt)
@@ -102,8 +112,8 @@ class GraphClient:
                         graph_code = str(exc.response.json().get("error", {}).get("code", ""))
                     except (ValueError, AttributeError):
                         pass
-                if status == 409 and graph_code == "nameAlreadyExists" and method.upper() == "POST":
-                    logger.info("Graph folder already exists; treating nameAlreadyExists as success")
+                if status == 409 and graph_code == "nameAlreadyExists" and method.upper() in {"POST", "PUT"}:
+                    logger.warning("Graph reported a recoverable name collision for %s", method.upper())
                 else:
                     logger.error("Graph request failed permanently (HTTP %s, code %s)", status, graph_code or "unknown")
                 suffix = f", {graph_code}" if graph_code else ""
@@ -117,6 +127,12 @@ class GraphClient:
         path = parsed.path
         if "/shares/" in path:
             path = path.split("/shares/", 1)[0] + "/shares/[redacted]"
+        elif "/root:/" in path:
+            path = path.split("/root:/", 1)[0] + "/root:/[path]"
+        elif "/items/" in path:
+            prefix, suffix = path.split("/items/", 1)
+            item_id, separator, remainder = suffix.partition("/")
+            path = f"{prefix}/items/[id]{separator}{remainder}"
         return f"{parsed.netloc}{path}"
 
     def _request_details(self, method: str, url: str, **kwargs: Any) -> requests.Response:
@@ -314,14 +330,21 @@ class GraphClient:
         query = query.strip()
         if not query:
             return []
-        encoded_query = quote(query, safe="")
+        # Escape OData string literals before URL encoding so punctuation in
+        # references cannot alter the search expression.
+        escaped_query = query.replace("'", "''")
+        encoded_query = quote(escaped_query, safe="")
         url = (
             f"{drive_base}/root/search(q='{encoded_query}')"
             "?$select=id,name,file,folder,parentReference,webUrl,size&$top=100"
         )
         results: list[dict[str, Any]] = []
         seen: set[str] = set()
+        visited_pages: set[str] = set()
         while url:
+            if url in visited_pages:
+                raise RuntimeError("Microsoft Graph repeated a search page")
+            visited_pages.add(url)
             payload = self._request("GET", url).json()
             values = payload.get("value", [])
             if not isinstance(values, list):
@@ -334,13 +357,9 @@ class GraphClient:
                 if key not in seen:
                     seen.add(key)
                     results.append(item)
-                    if len(results) >= 100:
-                        url = ""
-                        break
             next_url = payload.get("@odata.nextLink")
-            if url:
-                url = str(next_url) if next_url else ""
-        logger.info("Graph drive search returned %s items for query %r", len(results), query)
+            url = str(next_url) if next_url else ""
+        logger.info("Graph drive search returned %s items", len(results))
         return results
 
     def download_item(self, item: dict[str, Any], drive_base: str | None = None) -> bytes:
@@ -350,24 +369,85 @@ class GraphClient:
             raise ValueError("Graph DriveItem has no id")
         item_drive = str(item.get("parentReference", {}).get("driveId", ""))
         selected_drive = f"{self.base}/drives/{quote(item_drive, safe='')}" if item_drive else (drive_base or self.drive_base)
+        parsed_drive = urlparse(selected_drive)
+        valid_graph_prefix = (
+            parsed_drive.scheme == "https"
+            and parsed_drive.netloc.casefold() == "graph.microsoft.com"
+            and parsed_drive.path.startswith("/v1.0/")
+            and not parsed_drive.query
+            and not parsed_drive.fragment
+        )
+        if not valid_graph_prefix:
+            raise ValueError("Graph drive reference is invalid")
         return self._request(
             "GET", f"{selected_drive}/items/{quote(item_id, safe='')}/content"
         ).content
+
+    def fresh_download_url(self, item_id: str, drive_base: str) -> str:
+        """Mint a new short-lived Graph link on demand; never persist its value."""
+        safe_id = quote(str(item_id).strip(), safe="")
+        if not safe_id:
+            raise ValueError("Graph DriveItem has no id")
+        parsed_drive = urlparse(drive_base)
+        if (
+            parsed_drive.scheme != "https"
+            or parsed_drive.netloc.casefold() != "graph.microsoft.com"
+            or not parsed_drive.path.startswith("/v1.0/")
+            or parsed_drive.query
+            or parsed_drive.fragment
+        ):
+            raise ValueError("Graph drive reference is invalid")
+        metadata = self._request(
+            "GET",
+            f"{drive_base}/items/{safe_id}?$select=id,name,@microsoft.graph.downloadUrl",
+        ).json()
+        download_url = str(metadata.get("@microsoft.graph.downloadUrl", ""))
+        parsed_download = urlparse(download_url)
+        if parsed_download.scheme != "https" or not parsed_download.netloc:
+            raise RuntimeError("Microsoft Graph did not return a valid download link")
+        return download_url
 
     def ensure_folder(self, folder: str, drive_base: str | None = None) -> None:
         drive_base = drive_base or self.drive_base
         current = ""
         for segment in self._safe_path(folder).split("/"):
-            parent = quote(current, safe="/")
-            url = f"{drive_base}/root:/{parent}:/children" if current else f"{drive_base}/root/children"
+            current = f"{current}/{segment}" if current else segment
+            cache_key = (drive_base, current.casefold())
+            if cache_key in self._ensured_folders:
+                continue
+
+            # Avoid POSTing an already existing folder on every request. Apart
+            # from reducing Graph traffic, this prevents routine 409 conflicts
+            # from looking like failed PDF processing in Vercel logs.
+            parent = current.rsplit("/", 1)[0] if "/" in current else ""
+            try:
+                children = self.list_children(parent, drive_base)
+                existing = next(
+                    (
+                        item for item in children
+                        if item.get("folder") is not None
+                        and str(item.get("name", "")).casefold() == segment.casefold()
+                    ),
+                    None,
+                )
+                if existing:
+                    self._ensured_folders.add(cache_key)
+                    continue
+            except RuntimeError:
+                # The following create call gives a clearer, definitive error
+                # if listing was denied or the parent path is unavailable.
+                logger.warning("Could not verify whether Graph folder exists; attempting create")
+
+            parent_encoded = quote(parent, safe="/")
+            url = f"{drive_base}/root:/{parent_encoded}:/children" if parent else f"{drive_base}/root/children"
             try:
                 self._request("POST", url, json={"name": segment, "folder": {}, "@microsoft.graph.conflictBehavior": "fail"})
             except RuntimeError as exc:
-                # Only an existing-name conflict is expected. Do not hide
-                # permission, network, or server failures as if the folder existed.
-                if "Microsoft Graph request failed (409" not in str(exc):
+                # A concurrent invocation may have created this exact folder
+                # after our listing. Ignore only that documented conflict.
+                if "nameAlreadyExists" not in str(exc):
                     raise
-            current = f"{current}/{segment}" if current else segment
+            self._ensured_folders.add(cache_key)
 
     def upload_pdf(self, path: str, content: bytes, drive_base: str | None = None, ensure_parent: bool = True) -> dict[str, Any]:
         drive_base = drive_base or self.drive_base
@@ -375,22 +455,34 @@ class GraphClient:
         parent = clean.rsplit("/", 1)[0] if "/" in clean else ""
         if parent and ensure_parent: self.ensure_folder(parent, drive_base)
         encoded = quote(clean, safe="/")
-        uploaded = self._request("PUT", f"{drive_base}/root:/{encoded}:/content", data=content, headers={"Content-Type": "application/pdf"}).json()
-        if not uploaded.get("@microsoft.graph.downloadUrl") and uploaded.get("id"):
-            item_id = quote(str(uploaded["id"]), safe="")
-            metadata_url = f"{drive_base}/items/{item_id}?$select=id,name,@microsoft.graph.downloadUrl"
-            metadata = {}
-            for attempt in range(3):
-                try:
-                    metadata = self._request("GET", metadata_url).json()
-                    break
-                except RuntimeError:
-                    if attempt == 2:
-                        raise
-                    time.sleep(attempt + 1)
+        try:
+            uploaded = self._request(
+                "PUT", f"{drive_base}/root:/{encoded}:/content", data=content,
+                headers={"Content-Type": "application/pdf"},
+            ).json()
+        except RuntimeError as exc:
+            # Repeated Wix submissions target the same sanitized filename.
+            # Graph normally replaces it through /content; if it reports a
+            # name collision, resolve the existing DriveItem and replace by ID.
+            if "409" not in str(exc) or "nameAlreadyExists" not in str(exc):
+                raise
+            existing = self._request(
+                "GET", f"{drive_base}/root:/{encoded}?$select=id,name,file"
+            ).json()
+            if not existing.get("id") or existing.get("file") is None:
+                raise
+            uploaded = self._request(
+                "PUT", f"{drive_base}/items/{quote(str(existing['id']), safe='')}/content",
+                data=content, headers={"Content-Type": "application/pdf"},
+            ).json()
+        # The upload response may omit the ephemeral download URL. The job
+        # stores the stable DriveItem ID and doesn't need that URL at upload.
+        if not uploaded.get("id"):
+            metadata_url = f"{drive_base}/root:/{encoded}?$select=id,name,file,parentReference"
+            metadata = self._request("GET", metadata_url).json()
+            if not metadata.get("id"):
+                raise RuntimeError("Microsoft Graph saved the PDF but did not return its DriveItem ID")
             uploaded.update(metadata)
-        if not uploaded.get("@microsoft.graph.downloadUrl"):
-            raise RuntimeError("Microsoft Graph uploaded the PDF but did not return a download URL")
         return uploaded
 
     def upload_many_pdfs(self, folder: str, files: list[tuple[str, bytes]], max_workers: int = 10, drive_base: str | None = None) -> list[dict[str, Any]]:

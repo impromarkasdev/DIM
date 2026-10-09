@@ -4,7 +4,7 @@ import io
 import logging
 import re
 from collections import OrderedDict
-import fitz
+import pymupdf
 
 from .ocr import recognize_campo4_pages
 
@@ -17,12 +17,12 @@ FIELD_4_LABEL = re.compile(r"\b4\s*\.?\s*N[uú]mero\s+de\s+formulario", re.IGNOR
 FORM_NUMBER = re.compile(r"(?<!\d)((?:\d[\s\u00a0]*){15})[\s\u00a0]*[-‐‑‒–—−][\s\u00a0]*(\d)(?!\d)")
 
 
-def _is_blank(page: fitz.Page) -> bool:
+def _is_blank(page: pymupdf.Page) -> bool:
     """Treat pages with neither meaningful text nor meaningful rendered marks as blank."""
     text = re.sub(r"\s+", "", page.get_text("text"))
     if len(text) >= 3:
         return False
-    pixmap = page.get_pixmap(matrix=fitz.Matrix(0.2, 0.2), colorspace=fitz.csGRAY, alpha=False)
+    pixmap = page.get_pixmap(matrix=pymupdf.Matrix(0.2, 0.2), colorspace=pymupdf.csGRAY, alpha=False)
     # White is 255. A low count of darker pixels means an empty scanned page.
     return sum(pixel < 245 for pixel in pixmap.samples) < 40
 
@@ -45,7 +45,7 @@ def _find_form_number(text: str) -> str | None:
 
 def split_declarations_with_report(pdf_bytes: bytes) -> tuple[list[tuple[str, bytes]], list[int]]:
     try:
-        with fitz.open(stream=pdf_bytes, filetype="pdf") as source:
+        with pymupdf.open(stream=pdf_bytes, filetype="pdf") as source:
             page_texts = [page.get_text("text") for page in source]
             blank_pages = [_is_blank(page) for page in source]
             ocr_page_indexes = [
@@ -62,7 +62,7 @@ def split_declarations_with_report(pdf_bytes: bytes) -> tuple[list[tuple[str, by
                 except Exception:
                     logger.exception("PDF split: OCR fallback failed")
                     raise
-            # Keep source page indexes: fitz.Page objects are tied to the
+            # Keep source page indexes: pymupdf.Page objects are tied to the
             # document lifetime and cannot safely outlive this context.
             groups: OrderedDict[str, list[int]] = OrderedDict()
             current: str | None = None
@@ -97,13 +97,13 @@ def split_declarations_with_report(pdf_bytes: bytes) -> tuple[list[tuple[str, by
                 raise ValueError("No se encontró el Número de Formulario de 15 dígitos-guion-dígito en el PDF, ni con OCR")
             result: list[tuple[str, bytes]] = []
             for form_number, pages in groups.items():
-                with fitz.open() as document:
+                with pymupdf.open() as document:
                     for page_number in pages:
                         document.insert_pdf(source, from_page=page_number, to_page=page_number)
                     document.set_metadata({})
                     result.append((f"{form_number}.pdf", document.tobytes(garbage=4, deflate=True, clean=True)))
             return result, skipped_pages
-    except fitz.FileDataError as exc:
+    except pymupdf.FileDataError as exc:
         raise ValueError("Uploaded file is not a readable PDF") from exc
     except ValueError:
         raise
@@ -118,8 +118,8 @@ def split_declarations(pdf_bytes: bytes) -> list[tuple[str, bytes]]:
 def split_pages(pdf_bytes: bytes, original_name: str) -> list[tuple[str, bytes]]:
     """Copy nonblank pages with their existing PDF objects; avoid expensive re-rendering."""
     try:
-        source = fitz.open(stream=pdf_bytes, filetype="pdf")
-    except fitz.FileDataError as exc:
+        source = pymupdf.open(stream=pdf_bytes, filetype="pdf")
+    except pymupdf.FileDataError as exc:
         raise ValueError("The OneDrive item is not a readable PDF") from exc
     result: list[tuple[str, bytes]] = []
     with source:
@@ -127,7 +127,7 @@ def split_pages(pdf_bytes: bytes, original_name: str) -> list[tuple[str, bytes]]
         for page_number, page in enumerate(source, start=1):
             if _is_blank(page):
                 continue
-            with fitz.open() as document:
+            with pymupdf.open() as document:
                 document.insert_pdf(source, from_page=page_number - 1, to_page=page_number - 1)
                 output = io.BytesIO()
                 document.save(output, garbage=0, deflate=False)

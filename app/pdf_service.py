@@ -6,7 +6,7 @@ import re
 import unicodedata
 from typing import Iterable
 
-import fitz
+import pymupdf
 
 logger = logging.getLogger(__name__)
 
@@ -42,14 +42,14 @@ def _normalized_text(value: str) -> str:
     return re.sub(r"[^a-z0-9]+", " ", without_marks).strip()
 
 
-def _scaled_rect(page: fitz.Page, coordinates: tuple[float, float, float, float]) -> fitz.Rect:
+def _scaled_rect(page: pymupdf.Page, coordinates: tuple[float, float, float, float]) -> pymupdf.Rect:
     width_scale = page.rect.width / _REFERENCE_PAGE_SIZE[0]
     height_scale = page.rect.height / _REFERENCE_PAGE_SIZE[1]
     x0, y0, x1, y1 = coordinates
-    return fitz.Rect(x0 * width_scale, y0 * height_scale, x1 * width_scale, y1 * height_scale)
+    return pymupdf.Rect(x0 * width_scale, y0 * height_scale, x1 * width_scale, y1 * height_scale)
 
 
-def _add_redaction(page: fitz.Page, rectangle: fitz.Rect) -> None:
+def _add_redaction(page: pymupdf.Page, rectangle: pymupdf.Rect) -> None:
     page.add_redact_annot(rectangle, fill=(0, 0, 0), cross_out=False)
 
 
@@ -66,9 +66,9 @@ def redact_pdf(pdf_bytes: bytes, terms: Iterable[str] = ()) -> bytes:
     }
     try:
         logger.info("PDF redaction started (%s optional terms)", len(custom_terms))
-        with fitz.open(stream=pdf_bytes, filetype="pdf") as document:
+        with pymupdf.open(stream=pdf_bytes, filetype="pdf") as document:
             found_fields: set[int] = set()
-            target_rectangles: dict[int, list[fitz.Rect]] = {}
+            target_rectangles: dict[int, list[pymupdf.Rect]] = {}
             redacted_pages: set[int] = set()
 
             for page_number, page in enumerate(document, start=1):
@@ -116,7 +116,7 @@ def redact_pdf(pdf_bytes: bytes, terms: Iterable[str] = ()) -> bytes:
                 # Apply redaction to vector text and overwrite image pixels in
                 # the target cells. This prevents recovering the original text
                 # by selecting text or lifting a black overlay.
-                page.apply_redactions(images=fitz.PDF_REDACT_IMAGE_PIXELS)
+                page.apply_redactions(images=pymupdf.PDF_REDACT_IMAGE_PIXELS)
 
             if callable(getattr(document, "scrub", None)):
                 document.scrub()
@@ -130,7 +130,7 @@ def redact_pdf(pdf_bytes: bytes, terms: Iterable[str] = ()) -> bytes:
 
         # Reopen the exported bytes and verify the field cells, metadata, and
         # XMP packet are empty before returning anything to the upload handler.
-        with fitz.open(stream=sanitized, filetype="pdf") as verified:
+        with pymupdf.open(stream=sanitized, filetype="pdf") as verified:
             for page_number, rectangles in target_rectangles.items():
                 page = verified[page_number]
                 for rectangle in rectangles:
@@ -144,7 +144,7 @@ def redact_pdf(pdf_bytes: bytes, terms: Iterable[str] = ()) -> bytes:
 
         logger.info("PDF redaction verified (%s bytes)", len(sanitized))
         return sanitized
-    except (fitz.FileDataError, RuntimeError, ValueError) as exc:
+    except (pymupdf.FileDataError, RuntimeError, ValueError) as exc:
         if isinstance(exc, RuntimeError) and str(exc).startswith("PDF redaction failed:"):
             raise
         logger.exception("PDF redaction failed")

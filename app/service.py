@@ -8,7 +8,7 @@ from dataclasses import dataclass
 from datetime import datetime
 from typing import Any
 
-import fitz
+import pymupdf
 import pandas as pd
 
 from .config import Settings
@@ -72,7 +72,7 @@ def _form_pdf_name(form_number: str, source_name: str = "", pdf_bytes: bytes = b
         candidates = [source_name]
         if pdf_bytes:
             try:
-                with fitz.open(stream=pdf_bytes, filetype="pdf") as document:
+                with pymupdf.open(stream=pdf_bytes, filetype="pdf") as document:
                     candidates.extend(page.get_text("text") for page in document)
             except Exception as exc:
                 logger.warning("No se pudo recuperar Campo 4 del PDF para nombrarlo: %s", exc)
@@ -268,7 +268,7 @@ def _extract_declaration(pdf_bytes: bytes, form_number: str) -> bytes:
     if not target:
         raise RuntimeError("El número de formulario del Excel es inválido")
     try:
-        with fitz.open(stream=pdf_bytes, filetype="pdf") as source:
+        with pymupdf.open(stream=pdf_bytes, filetype="pdf") as source:
             selected: list[int] = []
             started = False
             for index, page in enumerate(source):
@@ -284,7 +284,7 @@ def _extract_declaration(pdf_bytes: bytes, form_number: str) -> bytes:
                     selected.append(index)  # preserve blank / continuation pages
             if not selected:
                 raise RuntimeError("El número de formulario no apareció en el DIM consolidado")
-            with fitz.open() as result:
+            with pymupdf.open() as result:
                 for index in selected:
                     result.insert_pdf(source, from_page=index, to_page=index)
                 result.set_metadata({})

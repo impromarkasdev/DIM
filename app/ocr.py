@@ -7,7 +7,7 @@ import time
 from typing import Sequence
 from urllib.parse import urlparse
 
-import fitz
+import pymupdf
 import requests
 from PIL import Image
 
@@ -16,9 +16,9 @@ API_VERSION = "2024-11-30"
 MAX_POLL_SECONDS = 150
 
 
-def _campo4_region(page: fitz.Page) -> fitz.Rect:
+def _campo4_region(page: pymupdf.Page) -> pymupdf.Rect:
     bounds = page.rect
-    return fitz.Rect(
+    return pymupdf.Rect(
         bounds.x0 + bounds.width * 0.54,
         bounds.y0 + bounds.height * 0.06,
         bounds.x1,
@@ -90,7 +90,7 @@ def _azure_read_pdf(pdf_bytes: bytes, page_indexes: Sequence[int], endpoint: str
         session.close()
 
 
-def _tesseract_page(page: fitz.Page, page_number: int) -> str:
+def _tesseract_page(page: pymupdf.Page, page_number: int) -> str:
     try:
         import pytesseract
     except ImportError as exc:
@@ -100,7 +100,7 @@ def _tesseract_page(page: fitz.Page, page_number: int) -> str:
     tesseract_cmd = os.getenv("TESSERACT_CMD", "").strip()
     if tesseract_cmd:
         pytesseract.pytesseract.tesseract_cmd = tesseract_cmd
-    pixmap = page.get_pixmap(matrix=fitz.Matrix(2.5, 2.5), clip=_campo4_region(page), alpha=False)
+    pixmap = page.get_pixmap(matrix=pymupdf.Matrix(2.5, 2.5), clip=_campo4_region(page), alpha=False)
     image = Image.open(io.BytesIO(pixmap.tobytes("png")))
     try:
         return pytesseract.image_to_string(image, config="--oem 1 --psm 6")
@@ -110,7 +110,7 @@ def _tesseract_page(page: fitz.Page, page_number: int) -> str:
         ) from exc
 
 
-def recognize_campo4_pages(document: fitz.Document, page_indexes: Sequence[int]) -> dict[int, str]:
+def recognize_campo4_pages(document: pymupdf.Document, page_indexes: Sequence[int]) -> dict[int, str]:
     """OCR just Campo 4 for all needed pages in one Azure operation when configured."""
     indexes = list(dict.fromkeys(int(index) for index in page_indexes))
     if not indexes:
@@ -122,11 +122,11 @@ def recognize_campo4_pages(document: fitz.Document, page_indexes: Sequence[int])
             raise RuntimeError("Configura AZURE_DOCUMENT_INTELLIGENCE_ENDPOINT y AZURE_DOCUMENT_INTELLIGENCE_KEY")
         # Azure receives a temporary PDF containing only the Campo 4 crop of
         # pages that lacked usable text, not the full confidential DIM.
-        with fitz.open() as crops:
+        with pymupdf.open() as crops:
             for index in indexes:
                 page = document.load_page(index)
                 pixmap = page.get_pixmap(
-                    matrix=fitz.Matrix(2.5, 2.5), clip=_campo4_region(page), alpha=False
+                    matrix=pymupdf.Matrix(2.5, 2.5), clip=_campo4_region(page), alpha=False
                 )
                 crop_page = crops.new_page(width=pixmap.width, height=pixmap.height)
                 crop_page.insert_image(crop_page.rect, stream=pixmap.tobytes("png"))

@@ -3,9 +3,11 @@ from __future__ import annotations
 import unittest
 
 from app.graph import GraphClient
+from app.errors import PermanentProcessingError
+from app.pdf_service import redact_pdf
 from app.security import create_jwt, decode_jwt
 from app.service import _safe_graph_search
-from api.admin.users import handler as UsersHandler
+from api.admin.users import _parse_active
 from app.queue_worker import process_dim_reference
 from vercel.queue import get_subscriptions
 
@@ -63,10 +65,10 @@ class SecurityTests(unittest.TestCase):
             decode_jwt(token, "x" * 48)
 
     def test_active_flag_rejects_ambiguous_values(self) -> None:
-        self.assertFalse(UsersHandler._parse_active("false"))
-        self.assertTrue(UsersHandler._parse_active("true"))
+        self.assertFalse(_parse_active("false"))
+        self.assertTrue(_parse_active("true"))
         with self.assertRaises(ValueError):
-            UsersHandler._parse_active("False maybe")
+            _parse_active("False maybe")
 
 
 class QueueConfigurationTests(unittest.TestCase):
@@ -78,6 +80,18 @@ class QueueConfigurationTests(unittest.TestCase):
         ]
         self.assertEqual(len(worker_subscriptions), 1)
         self.assertEqual(worker_subscriptions[0].topic, "dim-redaction")
+
+
+class RedactionSafetyTests(unittest.TestCase):
+    def test_missing_field_template_is_a_permanent_fail_closed_error(self) -> None:
+        import pymupdf
+
+        with pymupdf.open() as document:
+            page = document.new_page()
+            page.insert_text((50, 50), "Documento no compatible con la plantilla DIAN")
+            source = document.tobytes()
+        with self.assertRaises(PermanentProcessingError):
+            redact_pdf(source)
 
 
 if __name__ == "__main__":

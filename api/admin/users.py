@@ -7,17 +7,19 @@ from app.users import delete_user, list_users, upsert_user
 
 logger = logging.getLogger(__name__)
 
-class handler(ApiHandler):
-    @staticmethod
-    def _parse_active(value: object) -> bool:
-        if isinstance(value, bool):
-            return value
-        if value in ("true", "1", 1):
-            return True
-        if value in ("false", "0", 0):
-            return False
-        raise ValueError("active debe ser booleano")
 
+def _parse_active(value: object) -> bool:
+    """Parse the optional active flag without depending on Vercel's handler wrapper."""
+    if isinstance(value, bool):
+        return value
+    if value in ("true", "1", 1):
+        return True
+    if value in ("false", "0", 0):
+        return False
+    raise ValueError("active debe ser booleano")
+
+
+class handler(ApiHandler):
     def do_GET(self) -> None:
         try:
             self.claims(admin=True)
@@ -53,7 +55,7 @@ class handler(ApiHandler):
             role = body.get("role", "client")
             if not isinstance(email, str) or (password is not None and not isinstance(password, str)) or not isinstance(role, str):
                 raise ValueError("Los tipos de datos del usuario no son válidos")
-            user = upsert_user(email, password, role, self._parse_active(body.get("active", True)))
+            user = upsert_user(email, password, role, _parse_active(body.get("active", True)))
             self.respond(200, {"status":"saved", "user": user})
         except (KeyError, ValueError):
             self.respond(400, {"success": False, "message": "Los datos del usuario no son válidos."})

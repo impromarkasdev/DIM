@@ -12,6 +12,7 @@ import pymupdf
 import pandas as pd
 
 from .config import Settings
+from .errors import PermanentProcessingError
 from .graph import GraphClient
 from .pdf_splitter import FORM_NUMBER
 from .pdf_service import redact_pdf
@@ -520,6 +521,15 @@ def process_hierarchical_references(references: list[str], supplied_terms: list[
                 }],
                 "extraidoDeConsolidado": located.extracted_from_consolidated,
                 "diagnostico": diagnostics,
+            })
+        except PermanentProcessingError as exc:
+            logger.error("DIM: redacción rechazada por una verificación permanente")
+            results.append({
+                "referencia": reference,
+                "estado": "Error",
+                "detalle": str(exc),
+                "diagnostico": diagnostics,
+                "_permanentError": True,
             })
         except Exception as exc:
             logger.exception("DIM: fallo procesando una referencia")

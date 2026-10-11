@@ -8,6 +8,8 @@ from typing import Iterable
 
 import pymupdf
 
+from .errors import PermanentProcessingError
+
 logger = logging.getLogger(__name__)
 
 # Value-cell rectangles measured against the standard DIAN 500 page in the
@@ -68,7 +70,7 @@ def redact_pdf(pdf_bytes: bytes, terms: Iterable[str] = ()) -> bytes:
         logger.info("PDF redaction started (%s optional terms)", len(custom_terms))
         with pymupdf.open(stream=pdf_bytes, filetype="pdf") as document:
             found_fields: set[int] = set()
-            target_rectangles: dict[int, list[pymupdf.Rect]] = {}
+            target_rectangles: dict[int, list[tuple[int, pymupdf.Rect]]] = {}
             redacted_pages: set[int] = set()
 
             for page_number, page in enumerate(document, start=1):
@@ -81,11 +83,11 @@ def redact_pdf(pdf_bytes: bytes, terms: Iterable[str] = ()) -> bytes:
                 if matched_fields:
                     found_fields.update(matched_fields)
                     rectangles = [
-                        _scaled_rect(page, _SENSITIVE_FIELD_RECTS[field_number])
+                        (field_number, _scaled_rect(page, _SENSITIVE_FIELD_RECTS[field_number]))
                         for field_number in sorted(matched_fields)
                     ]
                     target_rectangles[page_number - 1] = rectangles
-                    for rectangle in rectangles:
+                    for _field_number, rectangle in rectangles:
                         _add_redaction(page, rectangle)
                     redacted_pages.add(page_number - 1)
                     logger.info(
@@ -98,15 +100,18 @@ def redact_pdf(pdf_bytes: bytes, terms: Iterable[str] = ()) -> bytes:
                 # by the request; do not apply broad defaults such as "nit".
                 for term in custom_terms:
                     for rectangle in page.search_for(term):
-                        if any(rectangle.intersects(target) for target in target_rectangles.get(page_number - 1, [])):
+                        if any(
+                            rectangle.intersects(target)
+                            for _field_number, target in target_rectangles.get(page_number - 1, [])
+                        ):
                             continue
                         _add_redaction(page, rectangle)
                         redacted_pages.add(page_number - 1)
 
             missing_fields = sorted(set(_SENSITIVE_FIELD_RECTS) - found_fields)
             if missing_fields:
-                raise ValueError(
-                    "No se pudo verificar la plantilla DIM: faltan las casillas "
+                raise PermanentProcessingError(
+                    "Plantilla DIM no verificable: faltan las casillas "
                     + ", ".join(map(str, missing_fields))
                 )
 
@@ -133,17 +138,23 @@ def redact_pdf(pdf_bytes: bytes, terms: Iterable[str] = ()) -> bytes:
         with pymupdf.open(stream=sanitized, filetype="pdf") as verified:
             for page_number, rectangles in target_rectangles.items():
                 page = verified[page_number]
-                for rectangle in rectangles:
+                for _field_number, rectangle in rectangles:
                     if page.get_textbox(rectangle).strip():
-                        raise RuntimeError("La verificación detectó texto residual en una casilla censurada")
+                        raise PermanentProcessingError(
+                            f"Verificación de censura falló en página {page_number + 1}, "
+                            f"casilla {_field_number}; no se publicó el archivo."
+                        )
             metadata = verified.metadata or {}
             if any(value for key, value in metadata.items() if key not in {"format", "encryption"}):
-                raise RuntimeError("La verificación detectó metadatos residuales en el PDF")
+                raise PermanentProcessingError("La verificación detectó metadatos residuales en el PDF")
             if verified.xref_xml_metadata():
-                raise RuntimeError("La verificación detectó metadatos XMP residuales en el PDF")
+                raise PermanentProcessingError("La verificación detectó metadatos XMP residuales en el PDF")
 
         logger.info("PDF redaction verified (%s bytes)", len(sanitized))
         return sanitized
+    except PermanentProcessingError:
+        logger.error("PDF redaction failed its safety verification")
+        raise
     except (pymupdf.FileDataError, RuntimeError, ValueError) as exc:
         if isinstance(exc, RuntimeError) and str(exc).startswith("PDF redaction failed:"):
             raise

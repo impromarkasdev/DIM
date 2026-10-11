@@ -10,6 +10,7 @@ import requests
 from vercel.queue import Message, RetryAfter, subscribe
 
 from .config import Settings
+from .errors import PermanentProcessingError
 from .graph import GraphClient
 from .jobs import _safe_error_message, claim_item, complete_item, retry_or_fail_item
 from .pdf_splitter import split_declarations_with_report
@@ -19,7 +20,7 @@ logger = logging.getLogger(__name__)
 MAX_DELIVERIES = 10
 
 
-def _alert_terminal_failure(job_id: str, item_index: int, error: str) -> None:
+def _alert_terminal_failure(job_id: str, item_index: int, error: str, attempt_count: int) -> None:
     """Send a minimal, secret-free alert to an optional admin webhook."""
     logger.critical(
         "Document job permanently failed: job=%s item=%s error=%s",
@@ -37,10 +38,11 @@ def _alert_terminal_failure(job_id: str, item_index: int, error: str) -> None:
         response = requests.post(
             webhook,
             json={
-                "text": f"DIM job {job_id} item {item_index} failed after {MAX_DELIVERIES} attempts: {error[:300]}",
+                "text": f"DIM job {job_id} item {item_index} failed on delivery {attempt_count}: {error[:300]}",
                 "event": "dim_job_failed",
                 "jobId": job_id,
                 "itemIndex": item_index,
+            "attemptCount": attempt_count,
                 "error": error[:300],
             },
             timeout=(3, 5),
@@ -113,6 +115,8 @@ async def process_dim_reference(message: Message[dict[str, Any]]) -> None:
             )["resultados"][0]
             if result.get("estado") == "Error":
                 detail = str(result.get("detalle", "No fue posible procesar el documento"))
+                if result.get("_permanentError"):
+                    raise PermanentProcessingError(detail)
                 raise RuntimeError(detail)
         complete_item(job_id, item_index, result)
         logger.info(
@@ -122,10 +126,12 @@ async def process_dim_reference(message: Message[dict[str, Any]]) -> None:
     except RetryAfter:
         raise
     except Exception as exc:
-        terminal = delivery_count >= MAX_DELIVERIES
+        terminal = isinstance(exc, PermanentProcessingError) or delivery_count >= MAX_DELIVERIES
         retry_or_fail_item(job_id, item_index, str(exc), terminal=terminal)
         if terminal:
-            _alert_terminal_failure(job_id, item_index, _safe_error_message(str(exc)))
+            _alert_terminal_failure(
+                job_id, item_index, _safe_error_message(str(exc)), delivery_count
+            )
             return
         retry_delay = min(300, 15 * (2 ** max(0, delivery_count - 1)))
         logger.warning(

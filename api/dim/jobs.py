@@ -11,6 +11,40 @@ from app.jobs import enqueue_job, get_download_target, get_job
 logger = logging.getLogger(__name__)
 
 
+def _refresh_download_links(job: dict, job_id: str, owner_email: str, is_admin: bool) -> None:
+    """Best-effort refresh of ephemeral links; never changes durable job state."""
+    graph = None
+    for item_index, result in enumerate(job["resultados"]):
+        if not result.get("downloadUrl"):
+            continue
+        target = get_download_target(job_id, item_index, 0, owner_email, is_admin)
+        if not target:
+            result["downloadUrl"] = None
+            continue
+        try:
+            if graph is None:
+                graph = GraphClient(Settings.from_env())
+            # Temporary Graph links are emitted only in this authenticated
+            # response and are never persisted in Neon.
+            result["downloadUrl"] = graph.fresh_download_url(
+                target["driveItemId"], target["driveBase"]
+            )
+            result.pop("downloadLinkPending", None)
+            result.pop("downloadMessage", None)
+        except Exception as exc:
+            # Keep status polling independent from transient Graph link errors.
+            logger.warning(
+                "Could not mint download link for completed job %s item %s (%s)",
+                job_id, item_index, type(exc).__name__,
+            )
+            result["downloadUrl"] = None
+            result["downloadLinkPending"] = True
+            result["downloadMessage"] = (
+                "El documento ya está procesado; no se pudo preparar el enlace de descarga. "
+                "Consulta nuevamente en unos momentos."
+            )
+
+
 class handler(ApiHandler):
     def do_GET(self) -> None:
         try:
@@ -33,21 +67,7 @@ class handler(ApiHandler):
             enqueue_job(job_id)
             job = get_job(job_id, owner_email, is_admin=is_admin)
             if job and job["status"] in {"completed", "partial"}:
-                graph = None
-                for item_index, result in enumerate(job["resultados"]):
-                    if not result.get("downloadUrl"):
-                        continue
-                    target = get_download_target(job_id, item_index, 0, owner_email, is_admin)
-                    if not target:
-                        result["downloadUrl"] = None
-                        continue
-                    if graph is None:
-                        graph = GraphClient(Settings.from_env())
-                    # The temporary Graph link is generated only in this
-                    # authenticated response and is never written into Neon.
-                    result["downloadUrl"] = graph.fresh_download_url(
-                        target["driveItemId"], target["driveBase"]
-                    )
+                _refresh_download_links(job, job_id, owner_email, is_admin)
             self.respond(200, {"success": True, **job})
         except AuthenticationError:
             self.respond(401, {"success": False, "message": "La sesión no es válida o expiró."})

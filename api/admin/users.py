@@ -73,12 +73,17 @@ class handler(ApiHandler):
             self.claims(admin=True)
             user_id = parse_qs(urlparse(self.path).query).get("id", [""])[0]
             if not user_id: raise ValueError("id query parameter is required")
-            if not delete_user(user_id): self.respond(404, {"error": "User not found or is an administrator"}); return
+            if not delete_user(user_id):
+                self.respond(404, {
+                    "success": False,
+                    "message": "No se encontró una cuenta de cliente con ese ID/correo, o la cuenta está protegida.",
+                })
+                return
             self.respond(200, {"status": "deleted", "id": user_id})
         except AuthenticationError:
             self.respond(401, {"success": False, "message": "La sesión no es válida o expiró."})
         except PermissionError:
-            self.respond(403, {"success": False, "message": "Se requiere acceso de administrador."})
+            self.respond(403, {"success": False, "message": "No se puede eliminar una cuenta de administrador."})
         except ValueError as exc:
             self.respond(400, {"success": False, "message": str(exc)})
         except RuntimeError as exc:

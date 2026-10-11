@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import unittest
+from unittest.mock import patch
 import pandas as pd
 
 from app.graph import GraphClient
@@ -11,6 +12,7 @@ from app.service import _excel_columns, _filename_matches_form, _safe_graph_sear
 from api.admin.users import _parse_active
 from app.queue_worker import process_dim_reference
 from vercel.queue import get_subscriptions
+from api.dim.jobs import _refresh_download_links
 
 
 class GraphSearchTests(unittest.TestCase):
@@ -70,6 +72,21 @@ class GraphSearchTests(unittest.TestCase):
         graph = type("SearchGraph", (), {"search_items": lambda self, query: (_ for _ in ()).throw(RuntimeError("Graph unavailable"))})()
         with self.assertRaisesRegex(RuntimeError, "Graph unavailable"):
             _safe_graph_search(graph, "reference")
+
+    def test_completed_job_status_survives_temporary_download_link_failure(self) -> None:
+        job = {
+            "status": "completed",
+            "resultados": [{"estado": "Exito", "downloadUrl": "/api/documents/download?jobId=x"}],
+        }
+        target = {"driveItemId": "drive-item", "driveBase": "https://graph.microsoft.com/v1.0/drives/drive"}
+        with patch("api.dim.jobs.get_download_target", return_value=target), \
+             patch("api.dim.jobs.Settings.from_env", return_value=object()), \
+             patch("api.dim.jobs.GraphClient", side_effect=RuntimeError("Graph unavailable")):
+            _refresh_download_links(job, "job-id", "client@example.com", False)
+        self.assertEqual(job["status"], "completed")
+        self.assertEqual(job["resultados"][0]["estado"], "Exito")
+        self.assertIsNone(job["resultados"][0]["downloadUrl"])
+        self.assertTrue(job["resultados"][0]["downloadLinkPending"])
 
 
 class SecurityTests(unittest.TestCase):

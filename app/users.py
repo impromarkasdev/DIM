@@ -310,5 +310,12 @@ def delete_user(id_or_email: str) -> bool:
         raise ValueError("id is required")
     column = "email" if "@" in value else "id"
     with _connection_pool().connection() as connection, connection.cursor() as cursor:
-        cursor.execute(f"DELETE FROM app_users WHERE {column}=%s AND role <> 'admin'", (value.lower() if column == "email" else value,))
+        lookup_value = value.lower() if column == "email" else value
+        cursor.execute(f"SELECT id,role FROM app_users WHERE {column}=%s", (lookup_value,))
+        user = cursor.fetchone()
+        if not user:
+            return False
+        if user["role"] == "admin":
+            raise PermissionError("Administrator accounts cannot be deleted through this endpoint")
+        cursor.execute("DELETE FROM app_users WHERE id=%s AND role <> 'admin'", (user["id"],))
         return cursor.rowcount == 1

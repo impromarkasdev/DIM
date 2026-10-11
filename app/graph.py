@@ -399,7 +399,9 @@ class GraphClient:
             raise ValueError("Graph drive reference is invalid")
         metadata = self._request(
             "GET",
-            f"{drive_base}/items/{safe_id}?$select=id,name,@microsoft.graph.downloadUrl",
+            # downloadUrl is an OData annotation. Some Graph resources omit
+            # it when $select is present, so request the normal DriveItem.
+            f"{drive_base}/items/{safe_id}",
         ).json()
         download_url = str(metadata.get("@microsoft.graph.downloadUrl", ""))
         parsed_download = urlparse(download_url)

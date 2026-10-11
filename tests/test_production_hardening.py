@@ -3,14 +3,20 @@ from __future__ import annotations
 import unittest
 from unittest.mock import patch
 import pandas as pd
+import pymupdf
 
 from app.graph import GraphClient
 from app.errors import GraphAccessDeniedError, PermanentProcessingError
 from app.pdf_service import redact_pdf
+from app.pdf_splitter import split_declarations_with_report
 from app.security import create_jwt, decode_jwt
 from app.service import (
     _excel_columns,
+    _extract_declaration,
     _filename_matches_form,
+    _find_pdf,
+    _pdf_contains_form,
+    _search_container,
     _safe_graph_search,
     _sheet_excel_columns,
     _walk_scope_for_containers,
@@ -38,6 +44,124 @@ class GraphSearchTests(unittest.TestCase):
         self.assertTrue(_filename_matches_form("_032026001406316-1.pdf", "032026001406316"))
         self.assertTrue(_filename_matches_form("032026001406316-1.pdf", "032026001406316-1"))
         self.assertFalse(_filename_matches_form("032026001406316-backup.pdf", "032026001406316"))
+
+    def test_filename_match_tolerates_one_digit_error_only_when_unambiguous(self) -> None:
+        item = {"id": "one", "name": "032026001406315-1.pdf", "file": {}}
+        self.assertTrue(_filename_matches_form(item["name"], "032026001406316-1"))
+        self.assertEqual(_find_pdf([item], "032026001406316-1"), item)
+        duplicate = {"id": "two", "name": "032026001406317-1.pdf", "file": {}}
+        self.assertIsNone(_find_pdf([item, duplicate], "032026001406316-1"))
+
+    def test_extractor_stops_before_the_next_declaration_and_keeps_continuation(self) -> None:
+        with pymupdf.open() as source:
+            first = source.new_page()
+            first.insert_text((50, 50), "4. Número de formulario\n032026001506542-7")
+            continuation = source.new_page()
+            continuation.insert_text((50, 50), "Aceptación : 032026001506542-7\nPágina 1 de 1")
+            next_declaration = source.new_page()
+            next_declaration.insert_text((50, 50), "4. Número de formulario\n032026001506262-1")
+            source_bytes = source.tobytes()
+
+        extracted = _extract_declaration(source_bytes, "032026001506542-7")
+        with pymupdf.open(stream=extracted, filetype="pdf") as result:
+            self.assertEqual(len(result), 2)
+            self.assertTrue(_pdf_contains_form(extracted, "032026001506542-7"))
+            self.assertFalse(_pdf_contains_form(extracted, "032026001506262-1"))
+
+    def test_supplied_pdf_sample_extracts_only_form_542_and_its_continuation(self) -> None:
+        from pathlib import Path
+
+        sample = Path(r"C:\Users\juanc\Downloads\032026001506542-7.pdf")
+        if not sample.exists():
+            self.skipTest("User PDF attachment is not present on this test machine")
+        original = sample.read_bytes()
+        self.assertFalse(_pdf_contains_form(original, "032026001506542-7"))
+        extracted = _extract_declaration(original, "032026001506542-7")
+        with pymupdf.open(stream=extracted, filetype="pdf") as result:
+            self.assertEqual(len(result), 2)
+            self.assertTrue(_pdf_contains_form(extracted, "032026001506542-7"))
+            self.assertFalse(_pdf_contains_form(extracted, "032026001506262-1"))
+
+    def test_splitter_separates_supplied_sample_into_exact_declarations(self) -> None:
+        from pathlib import Path
+
+        sample = Path(r"C:\Users\juanc\Downloads\032026001506542-7.pdf")
+        if not sample.exists():
+            self.skipTest("User PDF attachment is not present on this test machine")
+        files, skipped = split_declarations_with_report(sample.read_bytes())
+        self.assertEqual(skipped, [])
+        self.assertEqual(
+            [name for name, _ in files],
+            ["032026001506542-7.pdf", "032026001506262-1.pdf"],
+        )
+        page_counts = {}
+        for name, content in files:
+            with pymupdf.open(stream=content, filetype="pdf") as document:
+                page_counts[name] = len(document)
+        self.assertEqual(page_counts["032026001506542-7.pdf"], 2)
+        self.assertEqual(page_counts["032026001506262-1.pdf"], 1)
+
+    def test_splitter_skips_continuation_with_conflicting_acceptance_id(self) -> None:
+        with pymupdf.open() as source:
+            first = source.new_page()
+            first.insert_text((50, 50), "4. Número de formulario\n032026001506542-7")
+            conflicting_continuation = source.new_page()
+            conflicting_continuation.insert_text((50, 50), "Aceptación: 032026001506262-1\nPágina 1 de 1")
+            second = source.new_page()
+            second.insert_text((50, 50), "4. Número de formulario\n032026001506262-1")
+            source_bytes = source.tobytes()
+
+        files, skipped = split_declarations_with_report(source_bytes)
+        self.assertEqual(skipped, [2])
+        self.assertEqual(
+            [name for name, _ in files],
+            ["032026001506542-7.pdf", "032026001506262-1.pdf"],
+        )
+        self.assertTrue(all(len(pymupdf.open(stream=content, filetype="pdf")) == 1 for _, content in files))
+
+    def test_search_checks_processed_before_container_tree_and_validates_pdf(self) -> None:
+        with pymupdf.open() as document:
+            page = document.new_page()
+            page.insert_text((50, 50), "4. Número de formulario\n032026001506542-7")
+            valid_pdf = document.tobytes()
+
+        class FakeGraph:
+            base = "https://graph.microsoft.com/v1.0"
+            drive_base = f"{base}/drives/test-drive"
+
+            def __init__(self) -> None:
+                self.listed: list[str] = []
+
+            def get_item_by_path(self, _path: str) -> dict[str, object]:
+                return {"id": "container", "folder": {}}
+
+            def list_item_children(self, item_id: str) -> list[dict[str, object]]:
+                self.listed.append(item_id)
+                if item_id == "container":
+                    return [
+                        {"id": "processed", "name": "Procesados", "folder": {}},
+                        {"id": "dim", "name": "DIM", "folder": {}},
+                    ]
+                if item_id == "processed":
+                    return [{
+                        "id": "decl",
+                        "name": "032026001506542-7.pdf",
+                        "file": {},
+                        "parentReference": {"driveId": "test-drive"},
+                    }]
+                raise AssertionError("The search should return from Procesados before listing DIM")
+
+            def download_item(self, _item: dict[str, object]) -> bytes:
+                return valid_pdf
+
+        graph = FakeGraph()
+        located, consolidations = _search_container(
+            graph, "2026/Contenedor 147", "032026001506542-7", []
+        )
+        self.assertIsNotNone(located)
+        self.assertEqual(located.parent_folder, "2026/Contenedor 147/Procesados")
+        self.assertEqual(consolidations, [])
+        self.assertEqual(graph.listed, ["container", "processed"])
 
     def test_graph_client_never_sends_bearer_token_to_another_host(self) -> None:
         graph = object.__new__(GraphClient)

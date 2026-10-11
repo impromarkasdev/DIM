@@ -12,6 +12,7 @@ import requests
 from requests.adapters import HTTPAdapter
 
 from .config import Settings
+from .errors import GraphAccessDeniedError
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
@@ -117,6 +118,10 @@ class GraphClient:
                 else:
                     logger.error("Graph request failed permanently (HTTP %s, code %s)", status, graph_code or "unknown")
                 suffix = f", {graph_code}" if graph_code else ""
+                if status == 403 and graph_code in {"accessDenied", "Authorization_RequestDenied"}:
+                    raise GraphAccessDeniedError(
+                        f"Microsoft Graph request denied (HTTP 403{suffix})"
+                    ) from exc
                 raise RuntimeError(f"Microsoft Graph request failed ({status}{suffix})") from exc
         raise RuntimeError("Microsoft Graph request failed after retries")
 
@@ -320,11 +325,32 @@ class GraphClient:
             url = str(next_url) if next_url else ""
         return children
 
-    def search_items(self, query: str, drive_base: str | None = None) -> list[dict[str, Any]]:
-        """Search the selected OneDrive/SharePoint drive, following Graph pages.
+    def get_item_by_path(self, path: str, drive_base: str | None = None) -> dict[str, Any]:
+        """Resolve a root-relative folder/file path to its stable DriveItem ID."""
+        drive_base = drive_base or self.drive_base
+        clean = self._safe_path(path)
+        if not clean:
+            raise ValueError("A non-empty OneDrive path is required")
+        encoded = quote(clean, safe="/")
+        item = self._request(
+            "GET",
+            f"{drive_base}/root:/{encoded}?$select=id,name,folder,parentReference",
+        ).json()
+        if not item.get("id"):
+            raise RuntimeError("Microsoft Graph returned a DriveItem without an id")
+        return item
 
-        This is a drive-wide indexed search, not a recursive crawl. Callers must
-        still validate returned names/paths against authoritative Excel data.
+    def search_items(
+        self,
+        query: str,
+        drive_base: str | None = None,
+        folder_item_id: str | None = None,
+    ) -> list[dict[str, Any]]:
+        """Search within a DriveItem hierarchy (or the drive root if omitted).
+
+        Passing folder_item_id scopes the index search to that folder and all
+        descendants, which avoids both permission failures and irrelevant hits
+        from elsewhere in the owner's OneDrive.
         """
         drive_base = drive_base or self.drive_base
         query = query.strip()
@@ -334,8 +360,12 @@ class GraphClient:
         # references cannot alter the search expression.
         escaped_query = query.replace("'", "''")
         encoded_query = quote(escaped_query, safe="")
+        if folder_item_id:
+            parent = f"{drive_base}/items/{quote(folder_item_id.strip(), safe='')}/search"
+        else:
+            parent = f"{drive_base}/root/search"
         url = (
-            f"{drive_base}/root/search(q='{encoded_query}')"
+            f"{parent}(q='{encoded_query}')"
             "?$select=id,name,file,folder,parentReference,webUrl,size&$top=100"
         )
         results: list[dict[str, Any]] = []

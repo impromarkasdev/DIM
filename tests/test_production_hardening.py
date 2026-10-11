@@ -5,10 +5,16 @@ from unittest.mock import patch
 import pandas as pd
 
 from app.graph import GraphClient
-from app.errors import PermanentProcessingError
+from app.errors import GraphAccessDeniedError, PermanentProcessingError
 from app.pdf_service import redact_pdf
 from app.security import create_jwt, decode_jwt
-from app.service import _excel_columns, _filename_matches_form, _safe_graph_search, _sheet_excel_columns
+from app.service import (
+    _excel_columns,
+    _filename_matches_form,
+    _safe_graph_search,
+    _sheet_excel_columns,
+    _walk_scope_for_containers,
+)
 from api.admin.users import _parse_active
 from app.queue_worker import process_dim_reference
 from vercel.queue import get_subscriptions
@@ -68,10 +74,50 @@ class GraphSearchTests(unittest.TestCase):
         self.assertEqual(len(items), 130)
         self.assertEqual(len(requested), 2)
 
+    def test_drive_item_search_is_scoped_to_dim_root_folder(self) -> None:
+        graph = object.__new__(GraphClient)
+        graph.base = "https://graph.microsoft.com/v1.0"
+        graph.drive_base = f"{graph.base}/users/owner@example.com/drive"
+        requested: list[str] = []
+
+        def fake_request(method: str, url: str, **kwargs: object) -> object:
+            requested.append(url)
+            return type("Response", (), {"json": lambda self: {"value": []}})()
+
+        graph._request = fake_request  # type: ignore[method-assign]
+        self.assertEqual(graph.search_items("A367-LLA-81", folder_item_id="dim-root-id"), [])
+        self.assertIn("/items/dim-root-id/search(q='A367-LLA-81')", requested[0])
+        self.assertNotIn("/root/search", requested[0])
+
     def test_graph_search_errors_are_not_converted_to_empty_results(self) -> None:
-        graph = type("SearchGraph", (), {"search_items": lambda self, query: (_ for _ in ()).throw(RuntimeError("Graph unavailable"))})()
+        graph = type("SearchGraph", (), {"search_items": lambda self, query, **kwargs: (_ for _ in ()).throw(RuntimeError("Graph unavailable"))})()
         with self.assertRaisesRegex(RuntimeError, "Graph unavailable"):
-            _safe_graph_search(graph, "reference")
+            _safe_graph_search(graph, "reference", "dim-root-id")
+
+    def test_denied_global_graph_search_falls_back_to_local_container_search(self) -> None:
+        graph = type("SearchGraph", (), {"search_items": lambda self, query, **kwargs: (_ for _ in ()).throw(GraphAccessDeniedError("HTTP 403 accessDenied"))})()
+        self.assertEqual(_safe_graph_search(graph, "032026001506542-7", "dim-root-id"), [])
+
+    def test_container_fallback_crawls_only_the_configured_root_hierarchy(self) -> None:
+        tree = {
+            "dim-root": [
+                {"id": "year-2026", "name": "2026", "folder": {}},
+                {"id": "other", "name": "Otros", "folder": {}},
+            ],
+            "year-2026": [
+                {"id": "container-147", "name": "Contenedor 147 - IMP2026-148", "folder": {}},
+            ],
+            "other": [],
+            "container-147": [],
+        }
+        graph = type("FolderGraph", (), {
+            "list_item_children": lambda self, item_id: tree.get(item_id, []),
+        })()
+        diagnostics: list[str] = []
+        matches = _walk_scope_for_containers(
+            graph, "dim-root", "Impromarkas/Facturas", "Cont. 147", diagnostics
+        )
+        self.assertEqual(matches, ["Impromarkas/Facturas/2026/Contenedor 147 - IMP2026-148"])
 
     def test_completed_job_status_survives_temporary_download_link_failure(self) -> None:
         job = {

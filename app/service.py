@@ -13,6 +13,7 @@ import pandas as pd
 
 from .config import Settings
 from .errors import PermanentProcessingError
+from .errors import GraphAccessDeniedError
 from .graph import GraphClient
 from .pdf_splitter import FORM_NUMBER
 from .pdf_service import redact_pdf
@@ -247,18 +248,24 @@ def _is_pdf(item: dict[str, Any]) -> bool:
     return item.get("file") is not None and str(item.get("name", "")).casefold().endswith(".pdf")
 
 
-def _safe_graph_search(graph: GraphClient, query: str) -> list[dict[str, Any]]:
+def _safe_graph_search(graph: GraphClient, query: str, folder_item_id: str) -> list[dict[str, Any]]:
     try:
-        return graph.search_items(query)
+        return graph.search_items(query, folder_item_id=folder_item_id)
+    except GraphAccessDeniedError:
+        # Application permissions may allow listing known folders and
+        # downloading their contents while denying drive-wide search. That
+        # broad search is only an optimization/fallback; continue with the
+        # already enumerated container and its DIM CON LEVANTE PDF.
+        logger.warning("DIM: búsqueda global de Graph no autorizada; se continúa con la carpeta del contenedor")
+        return []
     except Exception as exc:
-        # Do not turn an unavailable or incomplete global search into a false
-        # "not found" result. Let the job retry or report a service failure.
+        # A transient or malformed global search must not become a false miss.
         logger.warning("DIM: búsqueda global de Graph falló (%s)", type(exc).__name__)
         raise
 
 
-def _global_form_matches(graph: GraphClient, form_number: str) -> list[dict[str, Any]]:
-    """Find individually named declaration PDFs anywhere in the selected drive."""
+def _global_form_matches(graph: GraphClient, form_number: str, folder_item_id: str) -> list[dict[str, Any]]:
+    """Find individually named PDFs anywhere below the configured DIM root."""
     digits = "".join(re.findall(r"\d", form_number))
     matches: dict[str, dict[str, Any]] = {}
     # Graph search may normalize punctuation; validate each result against the
@@ -266,7 +273,7 @@ def _global_form_matches(graph: GraphClient, form_number: str) -> list[dict[str,
     for query in dict.fromkeys((form_number.strip().lstrip("_"), digits)):
         if not query:
             continue
-        for item in _safe_graph_search(graph, query):
+        for item in _safe_graph_search(graph, query, folder_item_id):
             if not _is_pdf(item) or str(item.get("name", "")).casefold().startswith("redactada_"):
                 continue
             if _filename_matches_form(str(item.get("name", "")), form_number):
@@ -274,7 +281,9 @@ def _global_form_matches(graph: GraphClient, form_number: str) -> list[dict[str,
     return list(matches.values())
 
 
-def _global_pdf_content_candidates(graph: GraphClient, form_number: str, limit: int = 10) -> list[dict[str, Any]]:
+def _global_pdf_content_candidates(
+    graph: GraphClient, form_number: str, folder_item_id: str, limit: int = 10
+) -> list[dict[str, Any]]:
     """Return indexed PDF hits for the form number, including consolidated files.
 
     Microsoft Graph search can match file content as well as names. We verify
@@ -284,7 +293,7 @@ def _global_pdf_content_candidates(graph: GraphClient, form_number: str, limit: 
     digits = "".join(re.findall(r"\d", form_number))
     candidates: dict[str, dict[str, Any]] = {}
     for query in (form_number.strip().lstrip("_"), digits):
-        for item in _safe_graph_search(graph, query):
+        for item in _safe_graph_search(graph, query, folder_item_id):
             if not _is_pdf(item) or str(item.get("name", "")).casefold().startswith("redactada_"):
                 continue
             candidates[str(item.get("id", item.get("name", "")))] = item
@@ -297,7 +306,7 @@ def _global_pdf_content_candidates(graph: GraphClient, form_number: str, limit: 
     return ordered[:limit]
 
 
-def _global_container_paths(graph: GraphClient, shipment: str) -> list[str]:
+def _global_container_paths(graph: GraphClient, shipment: str, folder_item_id: str) -> list[str]:
     """Find shipment folders regardless of year or configured base directory."""
     queries = [shipment.strip()]
     container = re.search(r"\bcont(?:enedor)?\.?\s*(\d+)\b", shipment, re.IGNORECASE)
@@ -305,7 +314,7 @@ def _global_container_paths(graph: GraphClient, shipment: str) -> list[str]:
         queries.append(f"Contenedor {container.group(1)}")
     paths: dict[str, None] = {}
     for query in queries:
-        for item in _safe_graph_search(graph, query):
+        for item in _safe_graph_search(graph, query, folder_item_id):
             if item.get("folder") is None or not _shipment_matches(str(item.get("name", "")), shipment):
                 continue
             parent = _item_parent_path(item)
@@ -314,9 +323,11 @@ def _global_container_paths(graph: GraphClient, shipment: str) -> list[str]:
     return list(paths)
 
 
-def _global_consolidated_items(graph: GraphClient, shipment: str) -> list[dict[str, Any]]:
+def _global_consolidated_items(
+    graph: GraphClient, shipment: str, folder_item_id: str
+) -> list[dict[str, Any]]:
     candidates: dict[str, dict[str, Any]] = {}
-    for item in _safe_graph_search(graph, "DIM CON LEVANTE"):
+    for item in _safe_graph_search(graph, "DIM CON LEVANTE", folder_item_id):
         if not _is_pdf(item) or "dimconlevante" not in _plain(str(item.get("name", ""))):
             continue
         segments = _item_parent_path(item).split("/")
@@ -325,6 +336,50 @@ def _global_consolidated_items(graph: GraphClient, shipment: str) -> list[dict[s
         if any(_shipment_matches(segment, shipment) for segment in segments):
             candidates[str(item.get("id", item.get("name", "")))] = item
     return list(candidates.values())
+
+
+def _walk_scope_for_containers(
+    graph: GraphClient,
+    root_item_id: str,
+    root_path: str,
+    shipment: str,
+    diagnostics: list[str],
+    max_folders: int = 3000,
+    max_depth: int = 8,
+) -> list[str]:
+    """Fallback crawl limited to DIM_BASE_PATH when Graph search is unavailable."""
+    pending: list[tuple[str, str, int]] = [(root_item_id, root_path, 0)]
+    visited: set[str] = set()
+    matches: list[str] = []
+    while pending and len(visited) < max_folders:
+        item_id, path, depth = pending.pop()
+        if item_id in visited:
+            continue
+        visited.add(item_id)
+        try:
+            children = graph.list_item_children(item_id)
+        except Exception as exc:
+            logger.warning("DIM: no se pudo recorrer una carpeta dentro de la raíz autorizada (%s)", type(exc).__name__)
+            continue
+        for item in children:
+            if item.get("folder") is None:
+                continue
+            name = str(item.get("name", "")).strip()
+            child_id = str(item.get("id", "")).strip()
+            if not name or not child_id:
+                continue
+            child_path = f"{path}/{name}" if path else name
+            if _shipment_matches(name, shipment):
+                matches.append(child_path)
+                continue
+            if depth < max_depth and len(visited) + len(pending) < max_folders:
+                pending.append((child_id, child_path, depth + 1))
+    if pending:
+        diagnostics.append("El recorrido de respaldo alcanzó su límite de seguridad")
+        logger.warning("DIM: se alcanzó el límite de carpetas al recorrer la raíz de documentos")
+    if matches:
+        diagnostics.append(f"Contenedor localizado mediante recorrido de la carpeta raíz ({len(matches)} coincidencias)")
+    return matches
 
 
 def _extract_declaration(pdf_bytes: bytes, form_number: str) -> bytes:
@@ -433,6 +488,11 @@ def _walk_container(graph: GraphClient, container_path: str, diagnostics: list[s
 
 
 def _download_hierarchical_pdf(graph: GraphClient, entry: DimIndexRow, settings: Settings, diagnostics: list[str]) -> LocatedPdf:
+    root_item = graph.get_item_by_path(settings.dim_base_path)
+    if root_item.get("folder") is None:
+        raise RuntimeError("La ruta DIM_BASE_PATH configurada no corresponde a una carpeta")
+    root_item_id = str(root_item["id"])
+    diagnostics.append("Búsqueda acotada a la carpeta raíz de documentos DIM")
     containers = _container_paths(graph, entry, settings, diagnostics)
     if not containers:
         diagnostics.append("Sin contenedor coincidente en carpetas anuales ni raíz")
@@ -455,7 +515,7 @@ def _download_hierarchical_pdf(graph: GraphClient, entry: DimIndexRow, settings:
     # The form number is the strongest key in Excel. Search the whole selected
     # drive before concluding that a missing folder or /Procesados means 404.
     logger.info("DIM: buscando formulario exacto en todo el drive")
-    for direct in _global_form_matches(graph, entry.form_number):
+    for direct in _global_form_matches(graph, entry.form_number, root_item_id):
         parent = _item_parent_path(direct)
         diagnostics.append("PDF individual encontrado mediante búsqueda global del drive")
         return LocatedPdf(
@@ -466,7 +526,15 @@ def _download_hierarchical_pdf(graph: GraphClient, entry: DimIndexRow, settings:
     # Folder names can move between year directories or the configured base.
     # Graph search locates shipment folder candidates independently of either.
     known_paths = set(containers)
-    for container_path in _global_container_paths(graph, entry.shipment):
+    scoped_container_paths = _global_container_paths(graph, entry.shipment, root_item_id)
+    if not scoped_container_paths:
+        # Search indexing can lag behind newly uploaded folders or be denied
+        # independently of list-children permission. Crawl only the configured
+        # document root as a deterministic fallback—never the owner's whole drive.
+        scoped_container_paths = _walk_scope_for_containers(
+            graph, root_item_id, settings.dim_base_path, entry.shipment, diagnostics
+        )
+    for container_path in scoped_container_paths:
         if container_path in known_paths:
             continue
         logger.info("DIM: explorando contenedor localizado por búsqueda global")
@@ -488,7 +556,7 @@ def _download_hierarchical_pdf(graph: GraphClient, entry: DimIndexRow, settings:
 
     # Last resort: search all indexed consolidated DIMs and verify actual page
     # text. The candidate list is deliberately bounded for serverless latency.
-    for consolidated in _global_consolidated_items(graph, entry.shipment):
+    for consolidated in _global_consolidated_items(graph, entry.shipment, root_item_id):
         name = str(consolidated.get("name", "DIM CON LEVANTE.pdf"))
         parent = _item_parent_path(consolidated)
         try:
@@ -502,7 +570,7 @@ def _download_hierarchical_pdf(graph: GraphClient, entry: DimIndexRow, settings:
     # Last resort: Graph may index the form number from PDF contents even if a
     # consolidated file was renamed. Try only a few likely candidates so a miss
     # cannot turn into a long scan and a Wix-side timeout.
-    for candidate in _global_pdf_content_candidates(graph, entry.form_number):
+    for candidate in _global_pdf_content_candidates(graph, entry.form_number, root_item_id):
         name = str(candidate.get("name", "documento.pdf"))
         try:
             extracted = _extract_declaration(graph.download_item(candidate), entry.form_number)

@@ -25,6 +25,48 @@ def _excel_columns(year: str) -> tuple[int, int, int]:
     return (42, 43, 44) if int(year) >= 2024 else (41, 42, 43)
 
 
+def _sheet_excel_columns(frame: pd.DataFrame, year: str) -> tuple[int, int, int, int]:
+    """Resolve Excel columns from their headers, falling back to the known layout.
+
+    The workbook has drifted over time, including sheets whose physical column
+    positions do not match the year-based convention. Header names are the
+    source of truth when present; the year mapping remains for legacy sheets
+    without a recognizable header row.
+    """
+    expected = {
+        "referencia": "reference",
+        "embarque": "shipment",
+        "numeroformulario": "form",
+    }
+    scan_rows = min(len(frame.index), 20)
+    for row_index in range(scan_rows):
+        found: dict[str, list[int]] = {role: [] for role in expected.values()}
+        for column_index, value in enumerate(frame.iloc[row_index].tolist()):
+            normalized = _plain(_cell_text(value))
+            role = expected.get(normalized)
+            if role:
+                found[role].append(column_index)
+        if all(found.values()):
+            # Some sheets repeat NUMERO_FORMULARIO in a different data block.
+            # Choose the closest ordered triplet so all fields come from the
+            # same reference/shipment/form block.
+            triplets = [
+                (reference, shipment, form)
+                for reference in found["reference"]
+                for shipment in found["shipment"]
+                for form in found["form"]
+                if reference < shipment < form
+            ]
+            if triplets:
+                reference, shipment, form = min(
+                    triplets, key=lambda values: (values[2] - values[0], values[1] - values[0])
+                )
+                return row_index, reference, shipment, form
+
+    reference_column, shipment_column, form_column = _excel_columns(year)
+    return 0, reference_column, shipment_column, form_column
+
+
 @dataclass(frozen=True)
 class DimIndexRow:
     reference: str
@@ -55,6 +97,28 @@ def _plain(value: str) -> str:
 
 def _form_key(value: str) -> str:
     return "".join(re.findall(r"[a-z0-9]+", value.casefold()))
+
+
+def _filename_matches_form(filename: str, form_number: str) -> bool:
+    """Match a form number, including an optional DIAN check digit in the filename.
+
+    Excel sometimes stores only Campo 4's 15-digit base while split PDFs are
+    named with all 16 digits (`base-checkdigit`). Never accept arbitrary
+    trailing filename text as a match.
+    """
+    candidate = _form_key(filename.rsplit("/", 1)[-1].rsplit(".", 1)[0])
+    target = _form_key(form_number)
+    if not candidate or not target:
+        return False
+    if candidate == target:
+        return True
+    return (
+        target.isdigit()
+        and len(target) == 15
+        and candidate.isdigit()
+        and len(candidate) == 16
+        and candidate.startswith(target)
+    )
 
 
 def _form_pdf_name(form_number: str, source_name: str = "", pdf_bytes: bytes = b"") -> str:
@@ -104,18 +168,19 @@ def _read_master_index(workbook: bytes, settings: Settings) -> dict[str, DimInde
         if frame is None:
             logger.info("DIM Excel: hoja %s no existe", year)
             continue
-        reference_column, shipment_column, form_column = _excel_columns(year)
+        header_row, reference_column, shipment_column, form_column = _sheet_excel_columns(frame, year)
         if frame.shape[1] <= form_column:
             logger.warning("DIM Excel: hoja %s no contiene las columnas esperadas", year)
             continue
         logger.info(
-            "DIM Excel: revisando hoja %s (%s filas; columnas %s/%s/%s)",
-            year, len(frame.index), reference_column + 1, shipment_column + 1, form_column + 1,
+            "DIM Excel: revisando hoja %s (%s filas; columnas %s/%s/%s; encabezado fila %s)",
+            year, len(frame.index) - header_row - 1, reference_column + 1, shipment_column + 1,
+            form_column + 1, header_row + 1,
         )
         for column in (reference_column, shipment_column, form_column):
             frame.iloc[:, column] = frame.iloc[:, column].astype(str).str.strip()
         sheet_matches = 0
-        for _, row in frame.iterrows():
+        for _, row in frame.iloc[header_row + 1 :].iterrows():
             reference, shipment, form_number = (
                 _cell_text(row.iloc[column])
                 for column in (reference_column, shipment_column, form_column)
@@ -156,10 +221,9 @@ def _find_pdf(items: list[dict[str, Any]], form_number: str) -> dict[str, Any] |
         if item.get("file") is not None
         and str(item.get("name", "")).casefold().endswith(".pdf")
         and not str(item.get("name", "")).casefold().startswith("redactada_")
-        and target in _form_key(str(item.get("name", "")))
+        and _filename_matches_form(str(item.get("name", "")), form_number)
     ]
-    # Prefer the exact split declaration over any file whose name merely
-    # contains the form number.
+    # Prefer exact name without the optional DIAN check digit.
     return next(
         (item for item in candidates if _form_key(str(item.get("name", "")).rsplit(".", 1)[0]) == target),
         candidates[0] if candidates else None,
@@ -199,14 +263,13 @@ def _global_form_matches(graph: GraphClient, form_number: str) -> list[dict[str,
     matches: dict[str, dict[str, Any]] = {}
     # Graph search may normalize punctuation; validate each result against the
     # canonical form number locally to avoid confusing similar declarations.
-    for query in (form_number.strip().lstrip("_"), digits):
+    for query in dict.fromkeys((form_number.strip().lstrip("_"), digits)):
         if not query:
             continue
         for item in _safe_graph_search(graph, query):
             if not _is_pdf(item) or str(item.get("name", "")).casefold().startswith("redactada_"):
                 continue
-            name_key = _form_key(str(item.get("name", "")).rsplit(".", 1)[0])
-            if name_key == _form_key(form_number):
+            if _filename_matches_form(str(item.get("name", "")), form_number):
                 matches[str(item.get("id", item.get("name", "")))] = item
     return list(matches.values())
 

@@ -1,18 +1,36 @@
 from __future__ import annotations
 
 import unittest
+import pandas as pd
 
 from app.graph import GraphClient
 from app.errors import PermanentProcessingError
 from app.pdf_service import redact_pdf
 from app.security import create_jwt, decode_jwt
-from app.service import _safe_graph_search
+from app.service import _excel_columns, _filename_matches_form, _safe_graph_search, _sheet_excel_columns
 from api.admin.users import _parse_active
 from app.queue_worker import process_dim_reference
 from vercel.queue import get_subscriptions
 
 
 class GraphSearchTests(unittest.TestCase):
+    def test_excel_reference_columns_shift_after_2023(self) -> None:
+        self.assertEqual(_excel_columns("2023"), (41, 42, 43))  # AP/AQ/AR
+        self.assertEqual(_excel_columns("2024"), (42, 43, 44))  # AQ/AR/AS
+
+    def test_excel_headers_override_year_column_fallback(self) -> None:
+        # Current workbook sheets have drifted: actual headers are more reliable
+        # than a year-only offset (2026 AP/AQ/AR vs 2024 AQ/AR/AS).
+        current = pd.DataFrame([["NUMERO_FORMULARIO", "REFERENCIA", "EMBARQUE", "NUMERO_FORMULARIO"]])
+        older = pd.DataFrame([["NUMERO_FORMULARIO", "", "REFERENCIA", "EMBARQUE", "NUMERO_FORMULARIO"]])
+        self.assertEqual(_sheet_excel_columns(current, "2026"), (0, 1, 2, 3))
+        self.assertEqual(_sheet_excel_columns(older, "2023"), (0, 2, 3, 4))
+
+    def test_filename_match_accepts_optional_check_digit_only(self) -> None:
+        self.assertTrue(_filename_matches_form("_032026001406316-1.pdf", "032026001406316"))
+        self.assertTrue(_filename_matches_form("032026001406316-1.pdf", "032026001406316-1"))
+        self.assertFalse(_filename_matches_form("032026001406316-backup.pdf", "032026001406316"))
+
     def test_graph_client_never_sends_bearer_token_to_another_host(self) -> None:
         graph = object.__new__(GraphClient)
         graph.token = "test-token"

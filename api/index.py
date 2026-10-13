@@ -17,6 +17,7 @@ ROUTES = {
     "/api/dim/search-and-redact": "api.dim.search_redact",
     "/api/documents/jobs": "api.dim.jobs",
     "/api/documents/download": "api.documents.download",
+    "/api/documents/combine": "api.documents.combine",
     "/api/admin/jobs": "api.admin.jobs",
     "/api/cron/keep-alive": "api.cron.keep_alive",
     "/api/process": "api.process",

@@ -6,7 +6,8 @@ import {
     changeUserPassword,
     startSplitJob,
     startRedactionJob,
-    getDocumentJob
+    getDocumentJob,
+    combineRedactionJob
 } from 'backend/api';
 
 import { local, session } from 'wix-storage';
@@ -29,23 +30,16 @@ $w.onReady(async function () {
     }
 
     $w('#btnDownloadAdmin').hide();
-    $w('#repeaterAdminDownloads').hide();
     $w('#txtUserStatus').text = '';
     $w('#txtSplitStatus').text = '';
     $w('#txtRedactStatus').text = '';
-
-    $w('#repeaterAdminDownloads').onItemReady(($item, itemData) => {
-        $item('#txtAdminDownloadName').text = itemData.fileName;
-        $item('#btnAdminDownloadFile').label = 'Descargar';
-        $item('#btnAdminDownloadFile').link = itemData.downloadUrl;
-        $item('#btnAdminDownloadFile').target = '_blank';
-    });
 
     $w('#tableUsers').columns = [
         { id: 'col1', dataPath: 'displayId', label: 'ID', type: 'string', width: 70 },
         { id: 'col2', dataPath: 'email', label: 'Correo electrónico', type: 'string', width: 250 },
         { id: 'col3', dataPath: 'role', label: 'Rol', type: 'string', width: 100 }
     ];
+    $w('#tableUsers').rows = [];
     await loadUsersTable(token);
 
     const pending = readPendingJob();
@@ -111,7 +105,7 @@ $w.onReady(async function () {
     });
 
     $w('#btnChangeUserPassword').onClick(async () => {
-        const value = String($w('#inputDeleteUserId').value || '').trim();
+        const value = String($w('#inputPasswordUserId').value || '').trim();
         const newPassword = String($w('#inputChangeUserPassword').value || '');
         if (!value) {
             setUserStatus('Ingresa el número de fila, correo o ID del cliente.');
@@ -135,7 +129,7 @@ $w.onReady(async function () {
         setUserStatus('Actualizando la contraseña…');
         try {
             await changeUserPassword(token, selectedUser?.id || value, newPassword);
-            $w('#inputDeleteUserId').value = '';
+            $w('#inputPasswordUserId').value = '';
             $w('#inputChangeUserPassword').value = '';
             setUserStatus('La contraseña del cliente se actualizó correctamente.');
         } catch (error) {
@@ -183,7 +177,7 @@ $w.onReady(async function () {
         if (await resumeIfJobPending(token)) return;
 
         $w('#btnRedact').disable();
-        $w('#txtRedactStatus').text = 'Solicitud recibida. Consultando las referencias…';
+        $w('#txtRedactStatus').text = `Solicitud recibida. Progreso: 0 de ${references.length} referencias…`;
         try {
             const accepted = await startRedactionJob(token, references, makeIdempotencyKey('redact'));
             if (!accepted.jobId) throw new Error('El servicio no devolvió el identificador del trabajo.');
@@ -297,7 +291,7 @@ async function pollAndDisplayJob(token, pending) {
             }
         }
         if (pending.type === 'split') displaySplitResult(terminalJob);
-        else displayRedactionResult(terminalJob);
+        else await displayRedactionResult(token, terminalJob);
     } catch (error) {
         console.error('Error al consultar el trabajo:', error);
         setJobStatus(pending.type, error.message || 'No fue posible consultar el trabajo.');
@@ -325,32 +319,41 @@ function displaySplitResult(job) {
     $w('#txtSplitStatus').text = 'La solicitud continúa en proceso.';
 }
 
-function displayRedactionResult(job) {
+async function displayRedactionResult(token, job) {
     const results = Array.isArray(job.resultados) ? job.resultados : [];
-    const ready = results.filter(item => item?.estado === 'Exito' && item.downloadUrl);
-    const pendingLinks = results.some(item => item?.estado === 'Exito' && !item.downloadUrl);
-    if (ready.length) {
-        if (ready.length === 1) {
-            $w('#btnDownloadAdmin').link = ready[0].downloadUrl;
-            $w('#btnDownloadAdmin').target = '_blank';
-            $w('#btnDownloadAdmin').show();
-        } else {
-            $w('#repeaterAdminDownloads').data = ready.map((item, index) => ({
-                _id: `admin-file-${index}`,
-                fileName: item.nombre_pdf || item.fileName || `Declaración ${index + 1}.pdf`,
-                downloadUrl: item.downloadUrl
-            }));
-            $w('#repeaterAdminDownloads').show();
+    const successful = results.filter(item => item?.estado === 'Exito');
+    const ready = successful.filter(item => item.downloadUrl);
+    if (successful.length) {
+        let downloadUrl = ready[0]?.downloadUrl || '';
+        let downloadName = ready[0]?.nombre_pdf || 'El documento';
+        let combined = false;
+        if (successful.length > 1 || !downloadUrl) {
+            $w('#txtRedactStatus').text = `Se encontraron ${successful.length} documentos. Unificándolos en un solo PDF…`;
+            try {
+                const merged = await combineRedactionJob(token, job.jobId);
+                if (merged?.downloadUrl) {
+                    downloadUrl = merged.downloadUrl;
+                    downloadName = merged.fileName || 'PDF combinado';
+                    combined = true;
+                }
+            } catch (error) {
+                console.error('No se pudo unificar el PDF:', error);
+            }
         }
-        const missing = results.length - ready.length;
-        $w('#txtRedactStatus').text = ready.length === 1
-            ? `Consulta completada. ${ready[0].nombre_pdf || 'El documento'} está listo para descargar.${missing ? ` No se generaron ${missing} documento(s).` : ''}`
-            : `Consulta completada: ${ready.length} documentos listos para descargar.${missing ? ` No se generaron ${missing} documento(s).` : ''}`;
+        if (!downloadUrl) {
+            $w('#txtRedactStatus').text = 'El documento quedó procesado, pero el enlace no está disponible todavía. Vuelve a consultar en unos momentos.';
+            return;
+        }
+        $w('#btnDownloadAdmin').link = downloadUrl;
+        $w('#btnDownloadAdmin').target = '_blank';
+        $w('#btnDownloadAdmin').show();
+        const missing = results.length - successful.length;
+        $w('#txtRedactStatus').text = successful.length === 1
+            ? `Consulta completada. ${downloadName} está listo para descargar.${missing ? ` No se encontró documento para ${missing} referencia(s).` : ''}`
+            : combined
+                ? `Consulta completada: ${successful.length} documentos unificados en un PDF.${missing ? ` No se encontró documento para ${missing} referencia(s).` : ''}`
+                : `Se procesaron ${successful.length} documentos, pero no fue posible unificarlos. El botón descarga el primero; intenta nuevamente para generar el combinado.${missing ? ` No se encontró documento para ${missing} referencia(s).` : ''}`;
         local.removeItem(PENDING_JOB_KEY);
-        return;
-    }
-    if (pendingLinks) {
-        $w('#txtRedactStatus').text = 'El documento ya fue procesado, pero el enlace aún no está disponible. Vuelve a consultar el panel en unos momentos.';
         return;
     }
     if (['failed', 'partial'].includes(String(job.status || '').toLowerCase())) {
@@ -364,8 +367,6 @@ function displayRedactionResult(job) {
 
 function hideAdminDownloads() {
     $w('#btnDownloadAdmin').hide();
-    $w('#repeaterAdminDownloads').hide();
-    $w('#repeaterAdminDownloads').data = [];
 }
 
 function hasSuccessWithoutLink(job) {

@@ -1,5 +1,5 @@
 // Código completo del Cliente Dashboard
-import { processSearchAndRedact, getDocumentJobStatus } from 'backend/api';
+import { processSearchAndRedact, getDocumentJobStatus, combineRedactionJob } from 'backend/api';
 import { local, session } from 'wix-storage';
 import wixLocation from 'wix-location';
 
@@ -20,15 +20,7 @@ $w.onReady(function () {
     }
 
     $w('#btnDownloadClient').hide();
-    $w('#repeaterClientDownloads').hide();
     $w('#txtClientStatus').text = '';
-    $w('#repeaterClientDownloads').onItemReady(($item, itemData) => {
-        $item('#txtClientDownloadName').text = itemData.fileName;
-        $item('#btnClientDownloadFile').label = 'Descargar';
-        $item('#btnClientDownloadFile').link = itemData.downloadUrl;
-        $item('#btnClientDownloadFile').target = '_blank';
-    });
-
     $w('#btnClientSearch').onClick(async () => {
         if (searchInProgress) return;
         const references = normalizeReferences($w('#inputClientRef').value);
@@ -45,9 +37,7 @@ $w.onReady(function () {
 
         searchInProgress = true;
         $w('#btnClientSearch').disable();
-        setClientStatus(references.length === 1
-            ? 'Consultando la referencia y preparando el documento…'
-            : `Consultando ${references.length} referencias y preparando los documentos…`);
+        setClientStatus(`Progreso: 0 de ${references.length} referencias. Preparando la consulta…`);
 
         try {
             const job = await submitOrResumeRedaction(token, references);
@@ -57,26 +47,37 @@ $w.onReady(function () {
             }
 
             const results = Array.isArray(job.resultados) ? job.resultados : [];
-            const ready = results.filter(item => item?.estado === 'Exito' && item.downloadUrl);
-            if (ready.length) {
-                if (ready.length === 1) {
-                    $w('#btnDownloadClient').link = ready[0].downloadUrl;
-                    $w('#btnDownloadClient').target = '_blank';
-                    $w('#btnDownloadClient').show();
-                } else {
-                    $w('#repeaterClientDownloads').data = ready.map((item, index) => ({
-                        _id: `client-file-${index}`,
-                        fileName: item.nombre_pdf || item.fileName || `Declaración ${index + 1}.pdf`,
-                        downloadUrl: item.downloadUrl
-                    }));
-                    $w('#repeaterClientDownloads').show();
+            const successful = results.filter(item => item?.estado === 'Exito');
+            const ready = successful.filter(item => item.downloadUrl);
+            if (successful.length) {
+                let downloadUrl = ready[0]?.downloadUrl || '';
+                let combinedSucceeded = false;
+                if (successful.length > 1 || !downloadUrl) {
+                    setClientStatus(`Se encontraron ${successful.length} documentos. Unificándolos en un solo PDF…`);
+                    try {
+                        const combined = await combineRedactionJob(token, job.jobId);
+                        downloadUrl = combined?.downloadUrl || '';
+                        combinedSucceeded = Boolean(downloadUrl);
+                    } catch (error) {
+                        console.error('No se pudo unificar el PDF:', error);
+                    }
                 }
+                if (!downloadUrl) {
+                    saveJobCache(makeQueryKey(references), job.jobId);
+                    setClientStatus('El documento quedó procesado, pero el enlace no está disponible todavía. Vuelve a consultar en unos momentos.');
+                    return;
+                }
+                $w('#btnDownloadClient').link = downloadUrl;
+                $w('#btnDownloadClient').target = '_blank';
+                $w('#btnDownloadClient').show();
 
                 saveJobCache(makeQueryKey(references), job.jobId);
-                const missing = results.length - ready.length;
-                setClientStatus(ready.length === 1
-                    ? `Documento listo para descargar.${missing ? ` No se encontró documento para ${missing} referencia(s).` : ''}`
-                    : `${ready.length} documentos listos para descargar.${missing ? ` No se encontró documento para ${missing} referencia(s).` : ''}`);
+                const missing = results.length - successful.length;
+                setClientStatus(successful.length === 1
+                    ? `Consulta completada: 1 de ${references.length} documento(s) listo(s).${missing ? ` No se encontró documento para ${missing} referencia(s).` : ''}`
+                    : combinedSucceeded
+                        ? `Consulta completada: ${successful.length} documentos unificados en un PDF.${missing ? ` No se encontró documento para ${missing} referencia(s).` : ''}`
+                        : `Se procesaron ${successful.length} documentos. El botón descarga el primero; no se pudo generar el combinado.${missing ? ` No se encontró documento para ${missing} referencia(s).` : ''}`);
                 return;
             }
 
@@ -112,7 +113,7 @@ async function submitOrResumeRedaction(token, references) {
         const existing = await getDocumentJobStatus(token, cached.jobId);
         if (existing.success) {
             if (isTerminal(existing.status)) return existing;
-            return waitForJob(token, cached.jobId);
+            return waitForJob(token, cached.jobId, references.length);
         }
         if (existing.httpStatus !== 404) {
             throw new Error(existing.message || 'No fue posible consultar el trabajo anterior.');
@@ -126,10 +127,10 @@ async function submitOrResumeRedaction(token, references) {
         throw new Error(accepted.message || 'No fue posible iniciar la consulta.');
     }
     saveJobCache(queryKey, accepted.jobId, idempotencyKey);
-    return waitForJob(token, accepted.jobId);
+    return waitForJob(token, accepted.jobId, references.length);
 }
 
-async function waitForJob(token, jobId) {
+async function waitForJob(token, jobId, requestedTotal) {
     for (let attempt = 0; attempt < JOB_POLL_ATTEMPTS; attempt += 1) {
         const job = await getDocumentJobStatus(token, jobId);
         if (!job.success) {
@@ -139,6 +140,9 @@ async function waitForJob(token, jobId) {
             }
             throw new Error(job.message || 'No fue posible consultar el trabajo.');
         }
+        const total = Number(job.total || requestedTotal || 0);
+        const completed = Number(job.completed || 0);
+        setClientStatus(`Progreso: ${Math.min(completed, total)} de ${total} referencias procesadas…`);
         if (isTerminal(job.status)) return job;
         await delay(JOB_POLL_DELAY_MS);
     }
@@ -160,8 +164,6 @@ function normalizeReferences(value) {
 
 function hideDownloads() {
     $w('#btnDownloadClient').hide();
-    $w('#repeaterClientDownloads').hide();
-    $w('#repeaterClientDownloads').data = [];
 }
 
 function isTerminal(status) {

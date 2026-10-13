@@ -5,17 +5,21 @@ import wixLocation from 'wix-location';
 
 let loginInProgress = false;
 let passwordVisible = false;
+let togglePasswordButton = null;
 
 $w.onReady(function () {
-    $w('#txtError').text = '';
+    const errorText = getOptionalElement('#txtError');
+    if (errorText) errorText.text = '';
     $w('#inputPassword').inputType = 'password';
-    $w('#btnTogglePassword').label = 'Mostrar';
-
-    $w('#btnTogglePassword').onClick(() => {
-        passwordVisible = !passwordVisible;
-        $w('#inputPassword').inputType = passwordVisible ? 'text' : 'password';
-        $w('#btnTogglePassword').label = passwordVisible ? 'Ocultar' : 'Mostrar';
-    });
+    togglePasswordButton = getOptionalElement('#btnTogglePassword');
+    if (togglePasswordButton) {
+        togglePasswordButton.label = 'Mostrar';
+        togglePasswordButton.onClick(() => {
+            passwordVisible = !passwordVisible;
+            $w('#inputPassword').inputType = passwordVisible ? 'text' : 'password';
+            togglePasswordButton.label = passwordVisible ? 'Ocultar' : 'Mostrar';
+        });
+    }
 
     $w('#btnLogin').onClick(async () => {
         if (loginInProgress) return;
@@ -75,5 +79,10 @@ $w.onReady(function () {
 });
 
 function setLoginError(message) {
-    $w('#txtError').text = message;
+    const errorText = getOptionalElement('#txtError');
+    if (errorText) errorText.text = message;
+}
+
+function getOptionalElement(selector) {
+    try { return $w(selector); } catch (_) { return null; }
 }

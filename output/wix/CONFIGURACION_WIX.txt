@@ -14,20 +14,21 @@ Página Declaraciones:
 Admin Dashboard:
 - Añade un Text Input de contraseña #inputChangeUserPassword.
 - Añade un botón #btnChangeUserPassword.
-- Reutiliza #inputDeleteUserId para ingresar el número visible de fila, correo o UUID.
-- Añade un Repeater #repeaterAdminDownloads. Dentro de él agrega un texto #txtAdminDownloadName y un botón #btnAdminDownloadFile.
+- El campo para identificar al usuario cuyo password cambiar debe tener ID #inputPasswordUserId; el campo de eliminación conserva #inputDeleteUserId.
+- Convierte el campo actual de referencias #inputRedactRefs a Text Box multilínea; conserva el mismo ID.
+- No se necesita un repetidor: se conserva el botón de descarga actual. Si hay varios resultados, Vercel los combina en un solo PDF.
 
 Cliente Dashboard:
-- Cambia #inputClientRef por un Text Box multilínea, conservando el mismo ID.
-- Añade un Repeater #repeaterClientDownloads. Dentro agrega un texto #txtClientDownloadName y un botón #btnClientDownloadFile.
+- Cambia #inputClientRef por un Text Box multilínea (no Text Input), conservando el mismo ID.
+- No se necesita un repetidor: se conserva el botón de descarga actual. Si hay varios resultados, Vercel los combina en un solo PDF.
 - Se admiten separadores por salto de línea, coma o punto y coma; máximo 30 referencias por envío.
 
 PARTE VERCEL
 
-El backend del proyecto debe desplegarse antes de que el botón de cambio de contraseña funcione. Se añadió PATCH /api/admin/users, que solo permite a un administrador cambiar la contraseña de cuentas con rol client, por UUID o correo. No permite usar esta función para cambiar la contraseña de administradores.
+El backend debe desplegarse antes de usar cambio de contraseña o combinar varios PDFs. Se añadió PATCH /api/admin/users para que un administrador cambie contraseñas de cuentas cliente, y POST /api/documents/combine para producir un único PDF desde los resultados exitosos del trabajo. Ambos requieren JWT; el endpoint de combinación solo permite acceder al trabajo de la cuenta propietaria o a un administrador.
 
-El código compilado de Vercel se encuentra en el proyecto; publica el despliegue después de revisar los cambios. Después publica el sitio Wix.
+Importante: el backend/api.jsw que compartiste antes no exportaba changeUserPassword, aunque Admin Dashboard sí la importa. Reemplaza también ese archivo por api.jsw.txt actualizado; de lo contrario, Wix puede fallar al cargar todo el código de Admin (incluyendo la tabla y Cerrar sesión). Despliega Vercel primero y publica Wix después.
 
 NOTAS DE DESCARGA
 
-Una referencia usa el botón de descarga existente. Si una consulta produce varios PDFs, los repetidores presentan un botón separado por documento. En el Editor, ubica los repetidores en un contenedor de tamaño estable para que su aparición no desplace los botones de consulta.
+Se conserva el botón de descarga existente. Para varias referencias, el backend combina los documentos disponibles y ese mismo botón descarga el único PDF resultante.

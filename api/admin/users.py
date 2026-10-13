@@ -3,7 +3,7 @@ import logging
 from urllib.parse import parse_qs, urlparse
 
 from app.http_api import ApiHandler, AuthenticationError
-from app.users import delete_user, list_users, upsert_user
+from app.users import change_client_password, delete_user, list_users, upsert_user
 
 logger = logging.getLogger(__name__)
 
@@ -95,3 +95,56 @@ class handler(ApiHandler):
         except Exception:
             logger.exception("Unexpected user delete error")
             self.respond(500, {"success": False, "message": "No fue posible eliminar el usuario."})
+
+    def do_PATCH(self) -> None:
+        try:
+            self.claims(admin=True)
+        except AuthenticationError:
+            self.respond(401, {"success": False, "message": "La sesión no es válida o expiró."})
+            return
+        except PermissionError:
+            self.respond(403, {"success": False, "message": "Se requiere acceso de administrador."})
+            return
+        except RuntimeError as exc:
+            logger.exception("Could not validate administrator session for password reset")
+            status = 503 if "Database temporarily unavailable" in str(exc) else 500
+            self.respond(status, {
+                "success": False,
+                "message": "La autenticación está temporalmente ocupada. Inténtalo de nuevo."
+                if status == 503 else "No fue posible validar la sesión de administrador.",
+            })
+            return
+
+        try:
+            body = self.json_body()
+            target = body.get("id") or body.get("userId") or body.get("email")
+            password = body.get("password")
+            if not isinstance(target, str) or not isinstance(password, str):
+                raise ValueError("ID y contraseña son obligatorios")
+            if not 12 <= len(password) <= 1024:
+                raise ValueError("La contraseña debe tener entre 12 y 1024 caracteres.")
+            if not change_client_password(target, password):
+                self.respond(404, {
+                    "success": False,
+                    "message": "No se encontró una cuenta de cliente con ese ID o correo.",
+                })
+                return
+            self.respond(200, {"success": True, "message": "La contraseña se actualizó correctamente."})
+        except PermissionError:
+            self.respond(403, {
+                "success": False,
+                "message": "No se puede cambiar la contraseña de una cuenta de administrador desde esta pantalla.",
+            })
+        except ValueError as exc:
+            self.respond(400, {"success": False, "message": str(exc)})
+        except RuntimeError as exc:
+            logger.exception("User password update failed")
+            status = 503 if "Database temporarily unavailable" in str(exc) else 500
+            self.respond(status, {
+                "success": False,
+                "message": "La base de datos está temporalmente ocupada. Inténtalo de nuevo."
+                if status == 503 else "No fue posible actualizar la contraseña.",
+            })
+        except Exception:
+            logger.exception("Unexpected user password update error")
+            self.respond(500, {"success": False, "message": "No fue posible actualizar la contraseña."})

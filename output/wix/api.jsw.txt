@@ -1,0 +1,145 @@
+// backend/api.jsw
+import { fetch } from 'wix-fetch';
+
+const BACKEND_URL = 'https://dim-xi.vercel.app';
+const MAX_REFERENCES = 30;
+
+function makeIdempotencyKey(prefix) {
+    return `${prefix}-${Date.now()}-${Math.random().toString(36).slice(2, 12)}`;
+}
+
+function authHeaders(token) {
+    const value = String(token || '').trim();
+    if (!value) throw new Error('La sesión no es válida. Inicia sesión nuevamente.');
+    return {
+        Authorization: `Bearer ${value}`,
+        'Content-Type': 'application/json'
+    };
+}
+
+async function parseResponse(response) {
+    let data;
+    try {
+        data = await response.json();
+    } catch (_) {
+        const error = new Error(`El servicio devolvió una respuesta no válida (HTTP ${response.status}).`);
+        error.httpStatus = response.status;
+        throw error;
+    }
+    if (!response.ok || data?.success === false) {
+        const error = new Error(data?.message || data?.error || `No fue posible completar la solicitud (HTTP ${response.status}).`);
+        error.httpStatus = response.status;
+        throw error;
+    }
+    return data;
+}
+
+async function postJson(path, token, body, idempotencyKey) {
+    const headers = authHeaders(token);
+    if (idempotencyKey) headers['Idempotency-Key'] = idempotencyKey;
+    const response = await fetch(`${BACKEND_URL}${path}`, {
+        method: 'POST', headers, body: JSON.stringify(body)
+    });
+    return parseResponse(response);
+}
+
+export async function loginUser(email, password) {
+    try {
+        const response = await fetch(`${BACKEND_URL}/api/auth/login`, {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({
+                email: String(email || '').trim().toLowerCase(),
+                password: String(password || '')
+            })
+        });
+        return await parseResponse(response);
+    } catch (error) {
+        return {
+            success: false,
+            httpStatus: error?.httpStatus || 0,
+            message: error?.message || 'No fue posible conectar con el servicio de autenticación.'
+        };
+    }
+}
+
+export async function getUsers(token) {
+    const response = await fetch(`${BACKEND_URL}/api/admin/users`, {
+        method: 'GET', headers: authHeaders(token)
+    });
+    return parseResponse(response);
+}
+
+export async function createUser(token, userData) {
+    return postJson('/api/admin/users', token, userData);
+}
+
+export async function changeUserPassword(token, userIdOrEmail, password) {
+    const target = String(userIdOrEmail || '').trim();
+    const newPassword = String(password || '');
+    if (!target) throw new Error('Indica el ID o correo de la cuenta cliente.');
+    if (newPassword.length < 12 || newPassword.length > 1024) {
+        throw new Error('La nueva contraseña debe tener entre 12 y 1024 caracteres.');
+    }
+    const response = await fetch(`${BACKEND_URL}/api/admin/users`, {
+        method: 'PATCH',
+        headers: authHeaders(token),
+        body: JSON.stringify({ id: target, password: newPassword })
+    });
+    return parseResponse(response);
+}
+
+export async function deleteUser(token, userIdOrEmail) {
+    const value = String(userIdOrEmail || '').trim();
+    if (!value) throw new Error('Indica el usuario que deseas eliminar.');
+    const response = await fetch(
+        `${BACKEND_URL}/api/admin/users?id=${encodeURIComponent(value)}`,
+        { method: 'DELETE', headers: authHeaders(token) }
+    );
+    return parseResponse(response);
+}
+
+export async function getDocumentJob(token, jobId) {
+    const id = String(jobId || '').trim();
+    const uuidPattern = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
+    if (!uuidPattern.test(id)) throw new Error('El identificador del trabajo no es válido.');
+    const response = await fetch(
+        `${BACKEND_URL}/api/documents/jobs?jobId=${encodeURIComponent(id)}`,
+        { method: 'GET', headers: authHeaders(token) }
+    );
+    return parseResponse(response);
+}
+
+export async function getDocumentJobStatus(token, jobId) {
+    return getDocumentJob(token, jobId);
+}
+
+export async function startSplitJob(token, filePath, idempotencyKey) {
+    const path = String(filePath || '').trim();
+    if (!path) throw new Error('Ingresa el enlace del PDF que deseas separar.');
+    return postJson('/api/admin/split-pdf', token, { filePath: path }, idempotencyKey || makeIdempotencyKey('split'));
+}
+
+export async function splitOneDrivePDF(token, filePath, idempotencyKey) {
+    return startSplitJob(token, filePath, idempotencyKey);
+}
+
+export async function startRedactionJob(token, referencesPayload, idempotencyKey) {
+    const rawReferences = Array.isArray(referencesPayload)
+        ? referencesPayload
+        : typeof referencesPayload === 'string'
+            ? referencesPayload.split(/[\n,;]+/)
+            : [];
+    const references = [...new Set(rawReferences.map(value => String(value || '').trim()).filter(Boolean))];
+    if (!references.length || references.length > MAX_REFERENCES) {
+        throw new Error(`Ingresa entre 1 y ${MAX_REFERENCES} referencias válidas.`);
+    }
+    return postJson(
+        '/api/documents/process-redact', token, { references },
+        idempotencyKey || makeIdempotencyKey('redact')
+    );
+}
+
+export async function processSearchAndRedact(token, referencesPayload, idempotencyKey) {
+    return startRedactionJob(token, referencesPayload, idempotencyKey);
+}

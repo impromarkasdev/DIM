@@ -58,3 +58,6 @@ class handler(ApiHandler):
 
     def do_DELETE(self) -> None:
         self._dispatch("do_DELETE")
+
+    def do_PATCH(self) -> None:
+        self._dispatch("do_PATCH")

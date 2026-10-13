@@ -1,0 +1,33 @@
+PAQUETE DE CAMBIOS WIX — DIM
+
+1) Reemplaza backend/api.jsw con api.jsw.txt.
+2) Reemplaza el código de la página Declaraciones con declaraciones_login.js.txt.
+3) Reemplaza el código de Admin Dashboard con admin_dashboard.js.txt.
+4) Reemplaza el código de Cliente Dashboard con cliente_dashboard.js.txt.
+
+ELEMENTOS NUEVOS / CONFIGURACIÓN DEL EDITOR
+
+Página Declaraciones:
+- #inputPassword debe ser un Text Input configurado como Password.
+- Añade un botón #btnTogglePassword con texto inicial “Mostrar”, junto al campo.
+
+Admin Dashboard:
+- Añade un Text Input de contraseña #inputChangeUserPassword.
+- Añade un botón #btnChangeUserPassword.
+- Reutiliza #inputDeleteUserId para ingresar el número visible de fila, correo o UUID.
+- Añade un Repeater #repeaterAdminDownloads. Dentro de él agrega un texto #txtAdminDownloadName y un botón #btnAdminDownloadFile.
+
+Cliente Dashboard:
+- Cambia #inputClientRef por un Text Box multilínea, conservando el mismo ID.
+- Añade un Repeater #repeaterClientDownloads. Dentro agrega un texto #txtClientDownloadName y un botón #btnClientDownloadFile.
+- Se admiten separadores por salto de línea, coma o punto y coma; máximo 30 referencias por envío.
+
+PARTE VERCEL
+
+El backend del proyecto debe desplegarse antes de que el botón de cambio de contraseña funcione. Se añadió PATCH /api/admin/users, que solo permite a un administrador cambiar la contraseña de cuentas con rol client, por UUID o correo. No permite usar esta función para cambiar la contraseña de administradores.
+
+El código compilado de Vercel se encuentra en el proyecto; publica el despliegue después de revisar los cambios. Después publica el sitio Wix.
+
+NOTAS DE DESCARGA
+
+Una referencia usa el botón de descarga existente. Si una consulta produce varios PDFs, los repetidores presentan un botón separado por documento. En el Editor, ubica los repetidores en un contenedor de tamaño estable para que su aparición no desplace los botones de consulta.

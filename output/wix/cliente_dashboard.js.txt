@@ -1,0 +1,212 @@
+// Código completo del Cliente Dashboard
+import { processSearchAndRedact, getDocumentJobStatus } from 'backend/api';
+import { local, session } from 'wix-storage';
+import wixLocation from 'wix-location';
+
+const JOB_CACHE_KEY = 'dim_last_job';
+const JOB_CACHE_MAX_AGE_MS = 6 * 60 * 60 * 1000;
+const JOB_POLL_ATTEMPTS = 60;
+const JOB_POLL_DELAY_MS = 1500;
+const MAX_REFERENCES = 30;
+
+let searchInProgress = false;
+
+$w.onReady(function () {
+    const token = session.getItem('dim_jwt') || local.getItem('jwt_token') || local.getItem('userToken');
+    const role = String(session.getItem('dim_role') || local.getItem('user_role') || '').trim().toLowerCase();
+    if (!token || role !== 'client') {
+        wixLocation.to('/declaraciones');
+        return;
+    }
+
+    $w('#btnDownloadClient').hide();
+    $w('#repeaterClientDownloads').hide();
+    $w('#txtClientStatus').text = '';
+    $w('#repeaterClientDownloads').onItemReady(($item, itemData) => {
+        $item('#txtClientDownloadName').text = itemData.fileName;
+        $item('#btnClientDownloadFile').label = 'Descargar';
+        $item('#btnClientDownloadFile').link = itemData.downloadUrl;
+        $item('#btnClientDownloadFile').target = '_blank';
+    });
+
+    $w('#btnClientSearch').onClick(async () => {
+        if (searchInProgress) return;
+        const references = normalizeReferences($w('#inputClientRef').value);
+        hideDownloads();
+
+        if (!references.length) {
+            setClientStatus('Ingresa al menos una referencia. Puedes separarlas por líneas, comas o punto y coma.');
+            return;
+        }
+        if (references.length > MAX_REFERENCES) {
+            setClientStatus(`Puedes consultar hasta ${MAX_REFERENCES} referencias por solicitud.`);
+            return;
+        }
+
+        searchInProgress = true;
+        $w('#btnClientSearch').disable();
+        setClientStatus(references.length === 1
+            ? 'Consultando la referencia y preparando el documento…'
+            : `Consultando ${references.length} referencias y preparando los documentos…`);
+
+        try {
+            const job = await submitOrResumeRedaction(token, references);
+            if (job.pending) {
+                setClientStatus('La solicitud sigue en proceso. No vuelvas a enviarla; consulta nuevamente en unos momentos.');
+                return;
+            }
+
+            const results = Array.isArray(job.resultados) ? job.resultados : [];
+            const ready = results.filter(item => item?.estado === 'Exito' && item.downloadUrl);
+            if (ready.length) {
+                if (ready.length === 1) {
+                    $w('#btnDownloadClient').link = ready[0].downloadUrl;
+                    $w('#btnDownloadClient').target = '_blank';
+                    $w('#btnDownloadClient').show();
+                } else {
+                    $w('#repeaterClientDownloads').data = ready.map((item, index) => ({
+                        _id: `client-file-${index}`,
+                        fileName: item.nombre_pdf || item.fileName || `Declaración ${index + 1}.pdf`,
+                        downloadUrl: item.downloadUrl
+                    }));
+                    $w('#repeaterClientDownloads').show();
+                }
+
+                saveJobCache(makeQueryKey(references), job.jobId);
+                const missing = results.length - ready.length;
+                setClientStatus(ready.length === 1
+                    ? `Documento listo para descargar.${missing ? ` No se encontró documento para ${missing} referencia(s).` : ''}`
+                    : `${ready.length} documentos listos para descargar.${missing ? ` No se encontró documento para ${missing} referencia(s).` : ''}`);
+                return;
+            }
+
+            clearJobCache();
+            const notFoundCount = results.filter(item => item?.estado === 'Pendiente (No encontrado)').length;
+            setClientStatus(notFoundCount
+                ? `El proceso terminó. No se encontró una declaración para ${notFoundCount} referencia(s).`
+                : 'El proceso terminó sin generar documentos descargables. Inténtalo nuevamente o contacta al administrador.');
+        } catch (error) {
+            console.error('Error al consultar referencias:', error);
+            setClientStatus(error.message || 'No fue posible completar la consulta. Inténtalo nuevamente.');
+        } finally {
+            searchInProgress = false;
+            $w('#btnClientSearch').enable();
+        }
+    });
+
+    $w('#btnLogoutClient').onClick(() => {
+        session.removeItem('dim_jwt');
+        session.removeItem('dim_role');
+        local.removeItem('jwt_token');
+        local.removeItem('userToken');
+        local.removeItem('user_role');
+        session.removeItem(JOB_CACHE_KEY);
+        wixLocation.to('/declaraciones');
+    });
+});
+
+async function submitOrResumeRedaction(token, references) {
+    const queryKey = makeQueryKey(references);
+    const cached = readJobCache(queryKey);
+    if (cached?.jobId) {
+        const existing = await getDocumentJobStatus(token, cached.jobId);
+        if (existing.success) {
+            if (isTerminal(existing.status)) return existing;
+            return waitForJob(token, cached.jobId);
+        }
+        if (existing.httpStatus !== 404) {
+            throw new Error(existing.message || 'No fue posible consultar el trabajo anterior.');
+        }
+    }
+
+    const idempotencyKey = cached?.idempotencyKey || makeIdempotencyKey('redact');
+    saveJobCache(queryKey, cached?.jobId || '', idempotencyKey);
+    const accepted = await processSearchAndRedact(token, references, idempotencyKey);
+    if (!accepted.success || !accepted.jobId) {
+        throw new Error(accepted.message || 'No fue posible iniciar la consulta.');
+    }
+    saveJobCache(queryKey, accepted.jobId, idempotencyKey);
+    return waitForJob(token, accepted.jobId);
+}
+
+async function waitForJob(token, jobId) {
+    for (let attempt = 0; attempt < JOB_POLL_ATTEMPTS; attempt += 1) {
+        const job = await getDocumentJobStatus(token, jobId);
+        if (!job.success) {
+            if ([429, 502, 503, 504].includes(job.httpStatus)) {
+                await delay(JOB_POLL_DELAY_MS);
+                continue;
+            }
+            throw new Error(job.message || 'No fue posible consultar el trabajo.');
+        }
+        if (isTerminal(job.status)) return job;
+        await delay(JOB_POLL_DELAY_MS);
+    }
+    return { success: false, pending: true, jobId };
+}
+
+function normalizeReferences(value) {
+    const seen = new Set();
+    return String(value || '')
+        .split(/[\n,;]+/)
+        .map(item => item.trim())
+        .filter(item => {
+            const key = item.toUpperCase();
+            if (!key || seen.has(key)) return false;
+            seen.add(key);
+            return true;
+        });
+}
+
+function hideDownloads() {
+    $w('#btnDownloadClient').hide();
+    $w('#repeaterClientDownloads').hide();
+    $w('#repeaterClientDownloads').data = [];
+}
+
+function isTerminal(status) {
+    return ['completed', 'partial', 'failed'].includes(String(status || '').toLowerCase());
+}
+
+function makeQueryKey(references) {
+    return JSON.stringify(references.map(value => String(value).trim().toUpperCase()).sort());
+}
+
+function makeIdempotencyKey(prefix) {
+    return `${prefix}-${Date.now()}-${Math.random().toString(36).slice(2, 12)}`;
+}
+
+function readJobCache(queryKey) {
+    try {
+        const raw = session.getItem(JOB_CACHE_KEY);
+        if (!raw) return null;
+        const cache = JSON.parse(raw);
+        if (cache.queryKey !== queryKey || Date.now() - Number(cache.savedAt || 0) > JOB_CACHE_MAX_AGE_MS) {
+            return null;
+        }
+        return cache;
+    } catch (_) {
+        return null;
+    }
+}
+
+function saveJobCache(queryKey, jobId, idempotencyKey) {
+    session.setItem(JOB_CACHE_KEY, JSON.stringify({
+        queryKey,
+        jobId,
+        idempotencyKey,
+        savedAt: Date.now()
+    }));
+}
+
+function clearJobCache() {
+    session.removeItem(JOB_CACHE_KEY);
+}
+
+function delay(milliseconds) {
+    return new Promise(resolve => setTimeout(resolve, milliseconds));
+}
+
+function setClientStatus(message) {
+    $w('#txtClientStatus').text = message;
+}

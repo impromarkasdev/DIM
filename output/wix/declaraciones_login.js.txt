@@ -1,0 +1,79 @@
+// Código completo de la página Declaraciones (login)
+import { loginUser } from 'backend/api';
+import { local, session } from 'wix-storage';
+import wixLocation from 'wix-location';
+
+let loginInProgress = false;
+let passwordVisible = false;
+
+$w.onReady(function () {
+    $w('#txtError').text = '';
+    $w('#inputPassword').inputType = 'password';
+    $w('#btnTogglePassword').label = 'Mostrar';
+
+    $w('#btnTogglePassword').onClick(() => {
+        passwordVisible = !passwordVisible;
+        $w('#inputPassword').inputType = passwordVisible ? 'text' : 'password';
+        $w('#btnTogglePassword').label = passwordVisible ? 'Ocultar' : 'Mostrar';
+    });
+
+    $w('#btnLogin').onClick(async () => {
+        if (loginInProgress) return;
+
+        const email = String($w('#inputEmail').value || '').trim().toLowerCase();
+        const password = String($w('#inputPassword').value || '');
+        if (!email || !password) {
+            setLoginError('Ingresa tu correo electrónico y contraseña.');
+            return;
+        }
+
+        loginInProgress = true;
+        $w('#btnLogin').disable();
+        setLoginError('Verificando credenciales…');
+
+        try {
+            const response = await loginUser(email, password);
+            if (!response?.success) {
+                setLoginError(response?.message || 'No fue posible iniciar sesión. Verifica tus datos.');
+                return;
+            }
+
+            const token = response.token || response.jwt || response.accessToken;
+            const rawRole = response.user?.role || response.role || '';
+            const normalizedRole = String(rawRole).trim().toLowerCase();
+            const role = ['admin', 'administrator'].includes(normalizedRole)
+                ? 'admin'
+                : normalizedRole === 'client' ? 'client' : '';
+
+            if (!token) {
+                setLoginError('El servicio no devolvió una sesión válida. Inténtalo nuevamente.');
+                return;
+            }
+            if (!role) {
+                setLoginError('La cuenta no tiene un rol válido. Contacta al administrador.');
+                return;
+            }
+
+            // Las claves local conservan compatibilidad con el panel admin actual.
+            local.setItem('jwt_token', token);
+            local.setItem('userToken', token);
+            local.setItem('user_role', role);
+
+            // El dashboard cliente actual usa estas claves de sesión.
+            session.setItem('dim_jwt', token);
+            session.setItem('dim_role', role);
+
+            wixLocation.to(role === 'admin' ? '/admin-dashboard' : '/cliente-dashboard');
+        } catch (error) {
+            console.error('Error durante el inicio de sesión:', error);
+            setLoginError('No fue posible iniciar sesión. Inténtalo nuevamente.');
+        } finally {
+            loginInProgress = false;
+            $w('#btnLogin').enable();
+        }
+    });
+});
+
+function setLoginError(message) {
+    $w('#txtError').text = message;
+}

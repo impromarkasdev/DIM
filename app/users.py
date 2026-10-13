@@ -209,7 +209,7 @@ def session_is_active(email: str, role: str) -> bool:
     ensure_schema()
     with _connection_pool().connection() as connection, connection.cursor() as cursor:
         cursor.execute(
-            "SELECT 1 FROM app_users WHERE email=%s AND role=%s AND active=TRUE",
+            "SELECT 1 FROM app_users WHERE email=%s AND LOWER(BTRIM(role))=LOWER(BTRIM(%s)) AND active=TRUE",
             (email.strip().lower(), role),
         )
         return cursor.fetchone() is not None
@@ -299,6 +299,32 @@ def upsert_user(email: str, password: str | None, role: str, active: bool) -> di
         user_id = existing["id"] if existing else str(uuid4())
         cursor.execute("INSERT INTO app_users(id,email,password_hash,role,active) VALUES(%s,%s,%s,%s,%s) ON CONFLICT(email) DO UPDATE SET password_hash=EXCLUDED.password_hash,role=EXCLUDED.role,active=EXCLUDED.active RETURNING id,email,role,active,created_at", (user_id, email, password_hash, role, active))
         return cursor.fetchone()
+
+
+@_retry_database_operation
+def change_client_password(id_or_email: str, password: str) -> bool:
+    """Set a non-admin user's password by UUID or email; never returns password data."""
+    value = str(id_or_email or "").strip()
+    if not value:
+        raise ValueError("User ID or email is required")
+    if not isinstance(password, str) or not 12 <= len(password) <= 1024:
+        raise ValueError("Password must contain between 12 and 1024 characters")
+    column = "email" if "@" in value else "id"
+    lookup_value = value.lower() if column == "email" else value
+    ensure_schema()
+    with _connection_pool().connection() as connection, connection.cursor() as cursor:
+        cursor.execute(f"SELECT id,role FROM app_users WHERE {column}=%s", (lookup_value,))
+        user = cursor.fetchone()
+        if not user:
+            return False
+        if str(user["role"]).strip().casefold() != "client":
+            raise PermissionError("Only client account passwords can be changed through this endpoint")
+        password_hash = hash_password(password)
+        cursor.execute(
+            "UPDATE app_users SET password_hash=%s WHERE id=%s AND LOWER(BTRIM(role)) = 'client'",
+            (password_hash, user["id"]),
+        )
+        return cursor.rowcount == 1
 
 
 @_retry_database_operation

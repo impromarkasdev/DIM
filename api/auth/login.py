@@ -7,6 +7,12 @@ import os
 
 logger = logging.getLogger(__name__)
 
+
+def _normalize_login_role(value: object) -> str | None:
+    role = str(value or "").strip().casefold()
+    return role if role in {"admin", "client"} else None
+
+
 class handler(ApiHandler):
     def do_POST(self) -> None:
         try:
@@ -23,14 +29,27 @@ class handler(ApiHandler):
                 record_login_failure(email)
                 self.respond(401, {"success": False, "message": "Correo o contraseña incorrectos."})
                 return
+            role = _normalize_login_role(user.get("role"))
+            if role is None:
+                logger.error("Login rejected because account has an unsupported role")
+                self.respond(403, {"success": False, "message": "La cuenta no tiene un rol de acceso válido."})
+                return
             clear_login_failures(email)
             jwt_secret = os.getenv("JWT_SECRET", "")
             if len(jwt_secret.encode("utf-8")) < 32:
                 logger.error("JWT_SECRET is missing or shorter than 32 bytes")
                 self.respond(500, {"success": False, "message": "El servicio de autenticación no está configurado."})
                 return
-            token = create_jwt({"sub": user["email"], "role": user["role"]}, jwt_secret)
-            self.respond(200, {"success": True, "token": token, "role": user["role"]})
+            normalized_email = str(user["email"]).strip().lower()
+            token = create_jwt({"sub": normalized_email, "role": role}, jwt_secret)
+            # Keep the top-level fields Wix already consumes, and include a
+            # stable user object for clients reading res.user.role.
+            self.respond(200, {
+                "success": True,
+                "token": token,
+                "role": role,
+                "user": {"email": normalized_email, "role": role},
+            })
         except ValueError:
             self.respond(400, {"success": False, "message": "Invalid login request"})
         except RuntimeError as exc:

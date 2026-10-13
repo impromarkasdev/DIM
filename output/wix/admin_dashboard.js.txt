@@ -1,0 +1,412 @@
+// Código completo del Admin Dashboard
+import {
+    createUser,
+    getUsers,
+    deleteUser,
+    changeUserPassword,
+    startSplitJob,
+    startRedactionJob,
+    getDocumentJob
+} from 'backend/api';
+
+import { local, session } from 'wix-storage';
+import wixLocation from 'wix-location';
+
+const PENDING_JOB_KEY = 'dim_admin_pending_job';
+const POLL_INTERVAL_MS = 2500;
+const MAX_POLL_MS = 5 * 60 * 1000;
+const MAX_REFERENCES = 30;
+
+let currentUsersList = [];
+let pollingJob = false;
+
+$w.onReady(async function () {
+    const token = local.getItem('jwt_token') || local.getItem('userToken') || session.getItem('dim_jwt');
+    const role = String(local.getItem('user_role') || session.getItem('dim_role') || '').trim().toLowerCase();
+    if (!token || role !== 'admin') {
+        wixLocation.to('/declaraciones');
+        return;
+    }
+
+    $w('#btnDownloadAdmin').hide();
+    $w('#repeaterAdminDownloads').hide();
+    $w('#txtUserStatus').text = '';
+    $w('#txtSplitStatus').text = '';
+    $w('#txtRedactStatus').text = '';
+
+    $w('#repeaterAdminDownloads').onItemReady(($item, itemData) => {
+        $item('#txtAdminDownloadName').text = itemData.fileName;
+        $item('#btnAdminDownloadFile').label = 'Descargar';
+        $item('#btnAdminDownloadFile').link = itemData.downloadUrl;
+        $item('#btnAdminDownloadFile').target = '_blank';
+    });
+
+    $w('#tableUsers').columns = [
+        { id: 'col1', dataPath: 'displayId', label: 'ID', type: 'string', width: 70 },
+        { id: 'col2', dataPath: 'email', label: 'Correo electrónico', type: 'string', width: 250 },
+        { id: 'col3', dataPath: 'role', label: 'Rol', type: 'string', width: 100 }
+    ];
+    await loadUsersTable(token);
+
+    const pending = readPendingJob();
+    if (pending?.jobId && pending?.type) void resumePendingJob(token, pending);
+
+    $w('#btnCreateUser').onClick(async () => {
+        const email = String($w('#inputNewEmail').value || '').trim().toLowerCase();
+        const password = String($w('#inputNewPass').value || '');
+        if (!email || !email.includes('@')) {
+            setUserStatus('Ingresa un correo electrónico válido.');
+            return;
+        }
+        if (password.length < 12) {
+            setUserStatus('La contraseña debe tener al menos 12 caracteres.');
+            return;
+        }
+
+        $w('#btnCreateUser').disable();
+        setUserStatus('Creando la cuenta…');
+        try {
+            await createUser(token, { email, password, role: 'client', active: true });
+            $w('#inputNewEmail').value = '';
+            $w('#inputNewPass').value = '';
+            setUserStatus('La cuenta se creó correctamente.');
+            await loadUsersTable(token);
+        } catch (error) {
+            console.error('Error al crear usuario:', error);
+            setUserStatus(error.message || 'No fue posible crear la cuenta.');
+        } finally {
+            $w('#btnCreateUser').enable();
+        }
+    });
+
+    $w('#btnDeleteUser').onClick(async () => {
+        const value = String($w('#inputDeleteUserId').value || '').trim();
+        if (!value) {
+            setUserStatus('Ingresa el número de fila, correo o ID del usuario.');
+            return;
+        }
+        const selectedUser = resolveUser(value);
+        if (/^\d+$/.test(value) && !selectedUser) {
+            setUserStatus('Ese número de fila ya no corresponde a la lista actual. Actualiza la tabla.');
+            return;
+        }
+        if (selectedUser?.role === 'admin') {
+            setUserStatus('No se puede eliminar una cuenta de administrador.');
+            return;
+        }
+
+        $w('#btnDeleteUser').disable();
+        setUserStatus('Eliminando la cuenta…');
+        try {
+            await deleteUser(token, selectedUser?.id || value);
+            $w('#inputDeleteUserId').value = '';
+            setUserStatus('La cuenta se eliminó correctamente.');
+            await loadUsersTable(token);
+        } catch (error) {
+            console.error('Error al eliminar usuario:', error);
+            setUserStatus(error.message || 'No fue posible eliminar la cuenta.');
+        } finally {
+            $w('#btnDeleteUser').enable();
+        }
+    });
+
+    $w('#btnChangeUserPassword').onClick(async () => {
+        const value = String($w('#inputDeleteUserId').value || '').trim();
+        const newPassword = String($w('#inputChangeUserPassword').value || '');
+        if (!value) {
+            setUserStatus('Ingresa el número de fila, correo o ID del cliente.');
+            return;
+        }
+        const selectedUser = resolveUser(value);
+        if (/^\d+$/.test(value) && !selectedUser) {
+            setUserStatus('Ese número de fila ya no corresponde a la lista actual. Actualiza la tabla.');
+            return;
+        }
+        if (selectedUser?.role === 'admin') {
+            setUserStatus('Desde este panel solo se pueden cambiar contraseñas de cuentas cliente.');
+            return;
+        }
+        if (newPassword.length < 12 || newPassword.length > 1024) {
+            setUserStatus('La nueva contraseña debe tener entre 12 y 1024 caracteres.');
+            return;
+        }
+
+        $w('#btnChangeUserPassword').disable();
+        setUserStatus('Actualizando la contraseña…');
+        try {
+            await changeUserPassword(token, selectedUser?.id || value, newPassword);
+            $w('#inputDeleteUserId').value = '';
+            $w('#inputChangeUserPassword').value = '';
+            setUserStatus('La contraseña del cliente se actualizó correctamente.');
+        } catch (error) {
+            console.error('Error al cambiar contraseña:', error);
+            setUserStatus(error.message || 'No fue posible cambiar la contraseña.');
+        } finally {
+            $w('#btnChangeUserPassword').enable();
+        }
+    });
+
+    $w('#btnSplit').onClick(async () => {
+        const filePath = String($w('#inputSplitPath').value || '').trim();
+        if (!filePath) {
+            $w('#txtSplitStatus').text = 'Ingresa el enlace del PDF que deseas separar.';
+            return;
+        }
+        if (await resumeIfJobPending(token)) return;
+
+        $w('#btnSplit').disable();
+        $w('#txtSplitStatus').text = 'Solicitud recibida. Preparando la separación…';
+        try {
+            const accepted = await startSplitJob(token, filePath, makeIdempotencyKey('split'));
+            if (!accepted.jobId) throw new Error('El servicio no devolvió el identificador del trabajo.');
+            savePendingJob({ type: 'split', jobId: accepted.jobId });
+            await pollAndDisplayJob(token, { type: 'split', jobId: accepted.jobId });
+        } catch (error) {
+            console.error('Error al iniciar la separación:', error);
+            $w('#txtSplitStatus').text = error.message || 'No fue posible iniciar la separación.';
+        } finally {
+            $w('#btnSplit').enable();
+        }
+    });
+
+    $w('#btnRedact').onClick(async () => {
+        const references = normalizeReferences($w('#inputRedactRefs').value);
+        hideAdminDownloads();
+        if (!references.length) {
+            $w('#txtRedactStatus').text = 'Ingresa al menos una referencia para consultar.';
+            return;
+        }
+        if (references.length > MAX_REFERENCES) {
+            $w('#txtRedactStatus').text = `Puedes consultar hasta ${MAX_REFERENCES} referencias por solicitud.`;
+            return;
+        }
+        if (await resumeIfJobPending(token)) return;
+
+        $w('#btnRedact').disable();
+        $w('#txtRedactStatus').text = 'Solicitud recibida. Consultando las referencias…';
+        try {
+            const accepted = await startRedactionJob(token, references, makeIdempotencyKey('redact'));
+            if (!accepted.jobId) throw new Error('El servicio no devolvió el identificador del trabajo.');
+            savePendingJob({ type: 'redact', jobId: accepted.jobId });
+            await pollAndDisplayJob(token, { type: 'redact', jobId: accepted.jobId });
+        } catch (error) {
+            console.error('Error al consultar referencias:', error);
+            $w('#txtRedactStatus').text = error.message || 'No fue posible iniciar la consulta.';
+        } finally {
+            $w('#btnRedact').enable();
+        }
+    });
+
+    $w('#btnLogout').onClick(() => {
+        local.removeItem('jwt_token');
+        local.removeItem('userToken');
+        local.removeItem('user_role');
+        session.removeItem('dim_jwt');
+        session.removeItem('dim_role');
+        local.removeItem(PENDING_JOB_KEY);
+        wixLocation.to('/declaraciones');
+    });
+});
+
+function resolveUser(value) {
+    if (/^\d+$/.test(value)) {
+        return currentUsersList.find(user => user.displayId === value) || null;
+    }
+    if (value.includes('@')) {
+        return currentUsersList.find(user => String(user.email || '').toLowerCase() === value.toLowerCase()) || null;
+    }
+    return currentUsersList.find(user => String(user.id || '').toLowerCase() === value.toLowerCase()) || null;
+}
+
+async function loadUsersTable(token) {
+    try {
+        const response = await getUsers(token);
+        if (!Array.isArray(response.users)) throw new Error('El servicio no devolvió una lista de usuarios válida.');
+        currentUsersList = response.users.map((user, index) => ({
+            ...user,
+            id: String(user.id || user._id || user.userId || ''),
+            role: String(user.role || 'client').trim().toLowerCase(),
+            displayId: String(index + 1)
+        }));
+        $w('#tableUsers').rows = currentUsersList.map(user => ({
+            _id: user.id,
+            id: user.id,
+            displayId: user.displayId,
+            email: user.email || '',
+            role: user.role
+        }));
+        return true;
+    } catch (error) {
+        console.error('Error al cargar usuarios:', error);
+        currentUsersList = [];
+        $w('#tableUsers').rows = [];
+        setUserStatus(error.message || 'No fue posible cargar la lista de usuarios.');
+        return false;
+    }
+}
+
+async function resumeIfJobPending(token) {
+    const pending = readPendingJob();
+    if (!pending?.jobId) return false;
+    setJobStatus(pending.type, 'Retomando la solicitud existente…');
+    await pollAndDisplayJob(token, pending);
+    return true;
+}
+
+async function resumePendingJob(token, pending) {
+    setJobStatus(pending.type, 'Retomando la solicitud que quedó en curso…');
+    await pollAndDisplayJob(token, pending);
+}
+
+async function pollAndDisplayJob(token, pending) {
+    if (pollingJob) return;
+    pollingJob = true;
+    const startedAt = Date.now();
+    let consecutiveErrors = 0;
+    let terminalJob = null;
+    try {
+        while (Date.now() - startedAt < MAX_POLL_MS) {
+            await delay(POLL_INTERVAL_MS);
+            try {
+                const job = await getDocumentJob(token, pending.jobId);
+                consecutiveErrors = 0;
+                if (isTerminal(job.status)) {
+                    terminalJob = job;
+                    break;
+                }
+                setJobStatus(pending.type, job.total
+                    ? `Procesando la solicitud (${Number(job.completed || 0)} de ${Number(job.total)})…`
+                    : 'Procesando la solicitud…');
+            } catch (error) {
+                if ([401, 403, 404].includes(error.httpStatus)) throw error;
+                consecutiveErrors += 1;
+                setJobStatus(pending.type, 'El trabajo continúa en segundo plano. Consultando su estado…');
+                if (consecutiveErrors >= 8) break;
+            }
+        }
+        if (!terminalJob) {
+            setJobStatus(pending.type, 'La solicitud continúa en segundo plano. No la vuelvas a enviar; consulta nuevamente en unos momentos.');
+            return;
+        }
+        if (pending.type === 'redact' && hasSuccessWithoutLink(terminalJob)) {
+            for (let attempt = 0; attempt < 5; attempt += 1) {
+                await delay(1500);
+                try { terminalJob = await getDocumentJob(token, pending.jobId); }
+                catch (error) { console.warn('No se pudo renovar el enlace de descarga:', error); }
+                if (!hasSuccessWithoutLink(terminalJob)) break;
+            }
+        }
+        if (pending.type === 'split') displaySplitResult(terminalJob);
+        else displayRedactionResult(terminalJob);
+    } catch (error) {
+        console.error('Error al consultar el trabajo:', error);
+        setJobStatus(pending.type, error.message || 'No fue posible consultar el trabajo.');
+    } finally {
+        pollingJob = false;
+    }
+}
+
+function displaySplitResult(job) {
+    const item = (job.resultados || [])[0];
+    if (job.status === 'failed' || item?.estado === 'Error') {
+        $w('#txtSplitStatus').text = item?.detalle || job.lastError || 'La separación terminó con errores.';
+        local.removeItem(PENDING_JOB_KEY);
+        return;
+    }
+    if (['completed', 'partial'].includes(String(job.status || '').toLowerCase())) {
+        const count = Number(item?.count || 0);
+        const skipped = Number(item?.skippedPages || 0);
+        $w('#txtSplitStatus').text = count
+            ? `Separación completada: ${count} declaraciones procesadas${skipped ? `; ${skipped} páginas omitidas` : ''}.`
+            : 'La separación terminó, pero no se generaron declaraciones. Revisa el PDF de origen.';
+        local.removeItem(PENDING_JOB_KEY);
+        return;
+    }
+    $w('#txtSplitStatus').text = 'La solicitud continúa en proceso.';
+}
+
+function displayRedactionResult(job) {
+    const results = Array.isArray(job.resultados) ? job.resultados : [];
+    const ready = results.filter(item => item?.estado === 'Exito' && item.downloadUrl);
+    const pendingLinks = results.some(item => item?.estado === 'Exito' && !item.downloadUrl);
+    if (ready.length) {
+        if (ready.length === 1) {
+            $w('#btnDownloadAdmin').link = ready[0].downloadUrl;
+            $w('#btnDownloadAdmin').target = '_blank';
+            $w('#btnDownloadAdmin').show();
+        } else {
+            $w('#repeaterAdminDownloads').data = ready.map((item, index) => ({
+                _id: `admin-file-${index}`,
+                fileName: item.nombre_pdf || item.fileName || `Declaración ${index + 1}.pdf`,
+                downloadUrl: item.downloadUrl
+            }));
+            $w('#repeaterAdminDownloads').show();
+        }
+        const missing = results.length - ready.length;
+        $w('#txtRedactStatus').text = ready.length === 1
+            ? `Consulta completada. ${ready[0].nombre_pdf || 'El documento'} está listo para descargar.${missing ? ` No se generaron ${missing} documento(s).` : ''}`
+            : `Consulta completada: ${ready.length} documentos listos para descargar.${missing ? ` No se generaron ${missing} documento(s).` : ''}`;
+        local.removeItem(PENDING_JOB_KEY);
+        return;
+    }
+    if (pendingLinks) {
+        $w('#txtRedactStatus').text = 'El documento ya fue procesado, pero el enlace aún no está disponible. Vuelve a consultar el panel en unos momentos.';
+        return;
+    }
+    if (['failed', 'partial'].includes(String(job.status || '').toLowerCase())) {
+        $w('#txtRedactStatus').text = results.find(item => item?.detalle)?.detalle || job.lastError || 'La consulta terminó con errores.';
+        local.removeItem(PENDING_JOB_KEY);
+        return;
+    }
+    $w('#txtRedactStatus').text = 'No se encontró una declaración disponible para las referencias ingresadas.';
+    local.removeItem(PENDING_JOB_KEY);
+}
+
+function hideAdminDownloads() {
+    $w('#btnDownloadAdmin').hide();
+    $w('#repeaterAdminDownloads').hide();
+    $w('#repeaterAdminDownloads').data = [];
+}
+
+function hasSuccessWithoutLink(job) {
+    return (job?.resultados || []).some(item => item?.estado === 'Exito' && !item.downloadUrl);
+}
+
+function normalizeReferences(value) {
+    return [...new Set(String(value || '').split(/[\n,;]+/).map(item => item.trim()).filter(Boolean))];
+}
+
+function isTerminal(status) {
+    return ['completed', 'partial', 'failed'].includes(String(status || '').toLowerCase());
+}
+
+function setJobStatus(type, message) {
+    if (type === 'split') $w('#txtSplitStatus').text = message;
+    else $w('#txtRedactStatus').text = message;
+}
+
+function readPendingJob() {
+    try {
+        const raw = local.getItem(PENDING_JOB_KEY);
+        return raw ? JSON.parse(raw) : null;
+    } catch (_) {
+        local.removeItem(PENDING_JOB_KEY);
+        return null;
+    }
+}
+
+function savePendingJob(job) {
+    local.setItem(PENDING_JOB_KEY, JSON.stringify(job));
+}
+
+function makeIdempotencyKey(prefix) {
+    return `${prefix}-${Date.now()}-${Math.random().toString(36).slice(2, 12)}`;
+}
+
+function delay(milliseconds) {
+    return new Promise(resolve => setTimeout(resolve, milliseconds));
+}
+
+function setUserStatus(message) {
+    $w('#txtUserStatus').text = message;
+}

@@ -21,7 +21,8 @@ from app.service import (
     _sheet_excel_columns,
     _walk_scope_for_containers,
 )
-from api.admin.users import _parse_active
+from api.admin.users import _parse_active, handler as AdminUsersHandler
+from api.auth.login import _normalize_login_role
 from app.queue_worker import process_dim_reference
 from vercel.queue import get_subscriptions
 from api.dim.jobs import _refresh_download_links
@@ -260,6 +261,11 @@ class GraphSearchTests(unittest.TestCase):
 
 
 class SecurityTests(unittest.TestCase):
+    def test_login_role_is_normalized_for_wix_route_guards(self) -> None:
+        self.assertEqual(_normalize_login_role(" Client "), "client")
+        self.assertEqual(_normalize_login_role("ADMIN"), "admin")
+        self.assertIsNone(_normalize_login_role("customer"))
+
     def test_jwt_requires_strong_secret_and_valid_claims(self) -> None:
         with self.assertRaises(ValueError):
             create_jwt({"sub": "user@example.com", "role": "client"}, "weak")
@@ -274,6 +280,40 @@ class SecurityTests(unittest.TestCase):
         self.assertTrue(_parse_active("true"))
         with self.assertRaises(ValueError):
             _parse_active("False maybe")
+
+    def test_admin_users_route_exposes_password_change_method(self) -> None:
+        self.assertTrue(callable(getattr(AdminUsersHandler, "do_PATCH", None)))
+
+    def test_password_change_validates_length_and_uses_client_only(self) -> None:
+        from app.users import change_client_password
+
+        with self.assertRaises(ValueError):
+            change_client_password("client-id", "short")
+
+        from unittest.mock import MagicMock, patch
+
+        connection = MagicMock()
+        cursor = MagicMock()
+        pool = MagicMock()
+        pool.connection.return_value.__enter__.return_value = connection
+        connection.cursor.return_value.__enter__.return_value = cursor
+        cursor.fetchone.return_value = {"id": "client-id", "role": "client"}
+        cursor.rowcount = 1
+        with patch("app.users.ensure_schema"), \
+             patch("app.users._connection_pool", return_value=pool), \
+             patch("app.users.hash_password", return_value="hashed") as hash_password:
+            self.assertTrue(change_client_password("client-id", "long-enough-password"))
+            hash_password.assert_called_once_with("long-enough-password")
+            self.assertIn("LOWER(BTRIM(role)) = 'client'", cursor.execute.call_args_list[1].args[0])
+
+        cursor.reset_mock()
+        cursor.fetchone.return_value = {"id": "admin-id", "role": "admin"}
+        with patch("app.users.ensure_schema"), \
+             patch("app.users._connection_pool", return_value=pool), \
+             patch("app.users.hash_password") as hash_password:
+            with self.assertRaises(PermissionError):
+                change_client_password("admin-id", "long-enough-password")
+            hash_password.assert_not_called()
 
 
 class QueueConfigurationTests(unittest.TestCase):

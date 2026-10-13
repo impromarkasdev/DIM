@@ -26,7 +26,7 @@ class ApiHandler(BaseHTTPRequestHandler):
         if origin:
             self.send_header("Access-Control-Allow-Origin", origin); self.send_header("Vary", "Origin")
         self.send_header("Access-Control-Allow-Headers", "Authorization, Content-Type, Idempotency-Key")
-        self.send_header("Access-Control-Allow-Methods", "GET, POST, DELETE, OPTIONS")
+        self.send_header("Access-Control-Allow-Methods", "GET, POST, PATCH, DELETE, OPTIONS")
         self.send_header("Content-Length", str(len(body))); self.end_headers(); self.wfile.write(body)
 
     def binary(self, status: int, content: bytes, content_type: str, filename: str, extra_headers: dict[str, str] | None = None) -> None:
@@ -46,7 +46,7 @@ class ApiHandler(BaseHTTPRequestHandler):
             self.send_header("Access-Control-Allow-Origin", origin)
             self.send_header("Vary", "Origin")
         self.send_header("Access-Control-Allow-Headers", "Authorization, Content-Type, Idempotency-Key")
-        self.send_header("Access-Control-Allow-Methods", "GET, POST, DELETE, OPTIONS")
+        self.send_header("Access-Control-Allow-Methods", "GET, POST, PATCH, DELETE, OPTIONS")
         self.send_header("Content-Length", "0")
         self.end_headers()
 

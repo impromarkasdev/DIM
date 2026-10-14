@@ -338,13 +338,15 @@ async function displayRedactionResult(token, job) {
         let downloadUrl = ready[0]?.downloadUrl || '';
         let downloadName = ready[0]?.nombre_pdf || 'El documento';
         let combined = false;
+        let uniqueDeclarationCount = successful.length;
         if (successful.length > 1 || !downloadUrl) {
-            $w('#txtRedactStatus').text = `Se encontraron ${successful.length} documentos. Unificándolos en un solo PDF…`;
+            $w('#txtRedactStatus').text = `Se encontraron ${successful.length} resultados. Unificando declaraciones repetidas…`;
             try {
                 const merged = await combineRedactionJob(token, job.jobId);
                 if (merged?.downloadUrl) {
                     downloadUrl = merged.downloadUrl;
                     downloadName = merged.fileName || 'PDF combinado';
+                    uniqueDeclarationCount = Number(merged.combinedCount || successful.length);
                     combined = true;
                 }
             } catch (error) {
@@ -362,7 +364,7 @@ async function displayRedactionResult(token, job) {
         $w('#txtRedactStatus').text = successful.length === 1
             ? `Consulta completada. ${downloadName} está listo para descargar.${missing ? ` No se encontró documento para ${missing} referencia(s).` : ''}`
             : combined
-                ? `Consulta completada: ${successful.length} documentos unificados en un PDF.${missing ? ` No se encontró documento para ${missing} referencia(s).` : ''}`
+                ? `Consulta completada: ${uniqueDeclarationCount} declaración(es) única(s) en un PDF, para ${successful.length} referencia(s).${missing ? ` No se encontró documento para ${missing} referencia(s).` : ''}`
                 : `Se procesaron ${successful.length} documentos, pero no fue posible unificarlos. El botón descarga el primero; intenta nuevamente para generar el combinado.${missing ? ` No se encontró documento para ${missing} referencia(s).` : ''}`;
         local.removeItem(PENDING_JOB_KEY);
         return;

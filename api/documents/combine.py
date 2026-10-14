@@ -10,10 +10,17 @@ from app.config import Settings
 from app.graph import GraphClient
 from app.http_api import ApiHandler, AuthenticationError
 from app.jobs import get_download_target, get_job
+from app.pdf_splitter import _find_acceptance_form_number, _find_form_number
 
 logger = logging.getLogger(__name__)
 MAX_COMBINED_INPUT_BYTES = 100 * 1024 * 1024
 OUTPUT_FOLDER = "DIM/ConsultasCombinadas"
+FORM_NUMBER_RE = re.compile(r"(?<!\d)(\d{15})\s*[-‐‑‒–—−]\s*(\d)(?!\d)")
+
+
+def _form_key(value: object) -> str | None:
+    match = FORM_NUMBER_RE.search(str(value or ""))
+    return f"{match.group(1)}-{match.group(2)}" if match else None
 
 
 def _merge_pdf_contents(contents: list[bytes]) -> bytes:
@@ -24,10 +31,39 @@ def _merge_pdf_contents(contents: list[bytes]) -> bytes:
         raise ValueError("Los documentos superan el tamaño máximo para combinar en una sola descarga.")
 
     merged = fitz.open()
+    seen_forms: set[str] = set()
+    seen_pages: set[tuple[str, str]] = set()
     try:
         for content in contents:
             with fitz.open(stream=content, filetype="pdf") as source:
-                merged.insert_pdf(source)
+                # Avoid downloading/including the same declaration twice when
+                # different product references point to one Campo 4 number.
+                page_texts = [page.get_text("text") for page in source]
+                document_form = next((
+                    key
+                    for text in page_texts
+                    if (key := _form_key(_find_form_number(text) or _find_acceptance_form_number(text)))
+                ), None)
+                if document_form and document_form in seen_forms:
+                    continue
+                if document_form:
+                    seen_forms.add(document_form)
+
+                active_form = document_form
+                for page_index, page in enumerate(source):
+                    text = page_texts[page_index]
+                    page_form = _form_key(
+                        _find_form_number(text) or _find_acceptance_form_number(text)
+                    )
+                    if page_form:
+                        active_form = page_form
+                    normalized_text = " ".join(text.casefold().split())
+                    page_signature = (active_form or "", normalized_text)
+                    if active_form and normalized_text and page_signature in seen_pages:
+                        continue
+                    if active_form and normalized_text:
+                        seen_pages.add(page_signature)
+                    merged.insert_pdf(source, from_page=page_index, to_page=page_index)
         if merged.page_count == 0:
             raise ValueError("Los archivos no contienen páginas PDF válidas.")
         return merged.tobytes(garbage=4, deflate=True)
@@ -63,12 +99,19 @@ class handler(ApiHandler):
                 return
 
             handles: list[dict[str, str]] = []
+            seen_forms: set[str] = set()
             for item_index, item in enumerate(job.get("resultados", [])):
                 if item.get("estado") != "Exito":
+                    continue
+                form_key = _form_key(item.get("numeroFormulario") or item.get("nombre_pdf"))
+                if form_key and form_key in seen_forms:
+                    logger.info("Skipping duplicate declaration while combining job %s", job_id)
                     continue
                 target = get_download_target(job_id, item_index, 0, owner_email, is_admin)
                 if target:
                     handles.append(target)
+                    if form_key:
+                        seen_forms.add(form_key)
             if not handles:
                 self.respond(404, {"success": False, "message": "No hay documentos encontrados para combinar."})
                 return
@@ -92,7 +135,7 @@ class handler(ApiHandler):
                 "downloadUrl": download_url,
                 "fileName": filename,
                 "combinedCount": len(handles),
-                "message": "Los documentos disponibles se combinaron en un solo PDF.",
+                "message": "Las declaraciones disponibles se unificaron sin duplicados.",
             })
         except AuthenticationError:
             self.respond(401, {"success": False, "message": "La sesión no es válida o expiró."})

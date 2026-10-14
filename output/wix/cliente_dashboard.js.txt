@@ -52,11 +52,13 @@ $w.onReady(function () {
             if (successful.length) {
                 let downloadUrl = ready[0]?.downloadUrl || '';
                 let combinedSucceeded = false;
+                let uniqueDeclarationCount = successful.length;
                 if (successful.length > 1 || !downloadUrl) {
-                    setClientStatus(`Se encontraron ${successful.length} documentos. Unificándolos en un solo PDF…`);
+                    setClientStatus(`Se encontraron ${successful.length} resultados. Unificando declaraciones repetidas…`);
                     try {
                         const combined = await combineRedactionJob(token, job.jobId);
                         downloadUrl = combined?.downloadUrl || '';
+                        uniqueDeclarationCount = Number(combined?.combinedCount || successful.length);
                         combinedSucceeded = Boolean(downloadUrl);
                     } catch (error) {
                         console.error('No se pudo unificar el PDF:', error);
@@ -76,7 +78,7 @@ $w.onReady(function () {
                 setClientStatus(successful.length === 1
                     ? `Consulta completada: 1 de ${references.length} documento(s) listo(s).${missing ? ` No se encontró documento para ${missing} referencia(s).` : ''}`
                     : combinedSucceeded
-                        ? `Consulta completada: ${successful.length} documentos unificados en un PDF.${missing ? ` No se encontró documento para ${missing} referencia(s).` : ''}`
+                        ? `Consulta completada: ${uniqueDeclarationCount} declaración(es) única(s) unificada(s) en un PDF para ${successful.length} referencia(s).${missing ? ` No se encontró documento para ${missing} referencia(s).` : ''}`
                         : `Se procesaron ${successful.length} documentos. El botón descarga el primero; no se pudo generar el combinado.${missing ? ` No se encontró documento para ${missing} referencia(s).` : ''}`);
                 return;
             }

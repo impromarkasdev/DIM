@@ -356,6 +356,7 @@ def get_job(job_id: str, owner_email: str, is_admin: bool = False) -> dict[str, 
                 "estado": item["result"].get("estado") if item["result"] else item["status"],
                 "attempts": int(item["attempts"]),
                 "nombre_pdf": item["result"].get("nombre_pdf") if item["result"] else None,
+                "numeroFormulario": item["result"].get("numeroFormulario") if item["result"] else None,
                 "downloadUrl": (
                     f"/api/documents/download?jobId={job['id']}&itemIndex={item['item_index']}&fileIndex=0"
                     if item["result"] and item["result"].get("downloadFiles") else None

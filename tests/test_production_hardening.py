@@ -325,6 +325,70 @@ class QueueConfigurationTests(unittest.TestCase):
         ]
         self.assertEqual(len(worker_subscriptions), 1)
         self.assertEqual(worker_subscriptions[0].topic, "dim-redaction")
+        self.assertEqual(worker_subscriptions[0].max_concurrency, 5)
+
+    def test_queue_dispatch_failure_keeps_durable_job_id_and_returns_202(self) -> None:
+        import io
+        from unittest.mock import MagicMock
+        from api.dim.search_redact import handler as RedactionHandler
+
+        request = object.__new__(RedactionHandler)
+        body = b'{"references":["A367-LLA-81"]}'
+        request.headers = {
+            "Content-Length": str(len(body)),
+            "Idempotency-Key": "redact-test-key",
+        }
+        request.rfile = io.BytesIO(body)
+        request.claims = lambda: {"sub": "client@example.com"}
+        request.respond = MagicMock()
+        with patch("api.dim.search_redact.create_job", return_value=("job-uuid", True)), \
+             patch("api.dim.search_redact.enqueue_job", side_effect=RuntimeError("temporary queue/DB failure")), \
+             patch("api.dim.search_redact.get_job", return_value={
+                 "jobId": "job-uuid", "status": "queued", "total": 1, "completed": 0,
+             }):
+            request.do_POST()
+
+        status, payload = request.respond.call_args.args
+        self.assertEqual(status, 202)
+        self.assertEqual(payload["jobId"], "job-uuid")
+        self.assertTrue(payload["queueDispatchPending"])
+
+    def test_schema_preflight_is_read_only(self) -> None:
+        from app import users
+
+        pool = unittest.mock.MagicMock()
+        connection = pool.connection.return_value.__enter__.return_value
+        cursor = connection.cursor.return_value.__enter__.return_value
+        cursor.fetchone.return_value = {
+            "users": "app_users",
+            "login_attempts": "auth_login_attempts",
+        }
+        with patch("app.users._schema_ready", False), patch(
+            "app.users._connection_pool", return_value=pool
+        ):
+            users.ensure_schema()
+
+        sql = " ".join(call.args[0] for call in cursor.execute.call_args_list).upper()
+        self.assertIn("TO_REGCLASS", sql)
+        self.assertNotIn("CREATE TABLE", sql)
+        self.assertNotIn("ALTER TABLE", sql)
+
+    def test_deadlock_is_retried_by_idempotent_database_wrapper(self) -> None:
+        from app.users import _retry_database_operation
+        from psycopg.errors import DeadlockDetected
+
+        calls = {"count": 0}
+
+        @_retry_database_operation
+        def operation() -> str:
+            calls["count"] += 1
+            if calls["count"] == 1:
+                raise DeadlockDetected("simulated deadlock")
+            return "ok"
+
+        with patch("app.users.time.sleep"):
+            self.assertEqual(operation(), "ok")
+        self.assertEqual(calls["count"], 2)
 
     def test_expired_processing_lease_is_requeued_with_new_generation(self) -> None:
         from uuid import uuid4
@@ -342,6 +406,19 @@ class QueueConfigurationTests(unittest.TestCase):
         self.assertIn("queue_generation=queue_generation+1", statement)
         self.assertIn("lease_until < NOW()", statement)
         refresh_job.assert_called_once_with(cursor, job_id)
+
+    def test_unclaimed_queue_delivery_advances_generation_for_safe_republish(self) -> None:
+        from uuid import uuid4
+        from app.jobs import _refresh_stale_queued_deliveries
+
+        job_id = uuid4()
+        cursor = unittest.mock.MagicMock()
+        cursor.fetchall.return_value = [{"item_index": 0}, {"item_index": 2}]
+        self.assertEqual(_refresh_stale_queued_deliveries(cursor, job_id), 2)
+        statement = cursor.execute.call_args.args[0]
+        self.assertIn("queue_generation=queue_generation+1", statement)
+        self.assertIn("status='queued'", statement)
+        self.assertIn("queue_attempted_at < NOW()-INTERVAL '5 minutes'", statement)
 
 
 class RedactionSafetyTests(unittest.TestCase):

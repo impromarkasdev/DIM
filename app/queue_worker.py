@@ -52,7 +52,7 @@ def _alert_terminal_failure(job_id: str, item_index: int, error: str, attempt_co
         logger.error("Admin failure alert could not be delivered (%s)", type(exc).__name__)
 
 
-@subscribe(topic="dim-redaction", retry_after=60, max_concurrency=3)
+@subscribe(topic="dim-redaction", retry_after=60, max_concurrency=5)
 async def process_dim_reference(message: Message[dict[str, Any]]) -> None:
     """Queue consumer: process a single reference so each item can retry alone."""
     payload = message.payload

@@ -44,13 +44,23 @@ class handler(ApiHandler):
             if not retried:
                 self.respond(409, {"success": False, "message": "El trabajo no tiene elementos fallidos para reintentar."})
                 return
-            enqueue_job(job_id)
+            queue_dispatch_pending = False
+            try:
+                queue_dispatch_pending = enqueue_job(job_id) > 0
+            except Exception:
+                queue_dispatch_pending = True
+                logger.exception("Queue redispatch failed for manually retried job %s", job_id)
             job = get_job(job_id, owner_email, is_admin=True)
             self.respond(202, {
                 "success": True,
                 "retried": retried,
                 "job": job,
-                "message": "Se reprogramaron los elementos fallidos.",
+                "queueDispatchPending": queue_dispatch_pending,
+                "message": (
+                    "Los elementos fallidos quedaron reprogramados; se reintentará el envío a la cola."
+                    if queue_dispatch_pending
+                    else "Se reprogramaron los elementos fallidos."
+                ),
             })
         except AuthenticationError:
             self.respond(401, {"success": False, "message": "La sesión no es válida o expiró."})

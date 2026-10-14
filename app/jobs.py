@@ -9,7 +9,7 @@ from uuid import UUID, uuid4
 
 from psycopg.types.json import Jsonb
 
-from .users import _connection_pool, ensure_jobs_schema
+from .users import _connection_pool, _retry_database_operation, ensure_jobs_schema
 
 logger = logging.getLogger(__name__)
 QUEUE_TOPIC = "dim-redaction"
@@ -33,6 +33,7 @@ def _queue_client() -> Any:
     return QueueClient()
 
 
+@_retry_database_operation
 def create_job(
     owner_email: str,
     references: list[str],
@@ -79,6 +80,13 @@ def create_job(
 
 
 def _refresh_job(cursor: Any, job_id: UUID) -> None:
+    # Serialize aggregate refreshes for a job. Without this row lock, two
+    # workers completing at nearly the same time can both count the same old
+    # snapshot and overwrite `completed` with a stale value (e.g. 9/10 forever).
+    # All state-changing paths lock item rows before this job row.
+    cursor.execute("SELECT id FROM dim_jobs WHERE id=%s FOR UPDATE", (job_id,))
+    if not cursor.fetchone():
+        return
     cursor.execute(
         """
         SELECT COUNT(*) FILTER (WHERE status IN ('completed','not_found','failed','enqueue_failed')) AS terminal,
@@ -144,17 +152,42 @@ def _recover_expired_items(cursor: Any, job_id: UUID) -> int:
     return len(recovered_rows)
 
 
-def enqueue_job(job_id: str) -> None:
+def _refresh_stale_queued_deliveries(cursor: Any, job_id: UUID) -> int:
+    """Advance the queue idempotency key when a queued message was not claimed."""
+    cursor.execute(
+        """
+        UPDATE dim_job_items
+        SET queue_generation=queue_generation+1, queue_attempted_at=NULL,
+            error='La cola no confirmó el inicio a tiempo; se volverá a publicar.',
+            updated_at=NOW()
+        WHERE job_id=%s AND status='queued' AND queue_attempted_at IS NOT NULL
+          AND queue_attempted_at < NOW()-INTERVAL '5 minutes'
+        RETURNING item_index
+        """,
+        (job_id,),
+    )
+    stale_rows = cursor.fetchall()
+    if stale_rows:
+        logger.warning(
+            "Re-publishing %s queued DIM item(s) whose delivery was not claimed: job=%s",
+            len(stale_rows), job_id,
+        )
+    return len(stale_rows)
+
+
+@_retry_database_operation
+def enqueue_job(job_id: str) -> int:
     """Publish each reference independently; Queue delivery is at-least-once."""
     ensure_jobs_schema()
     parsed_id = UUID(job_id)
     with _connection_pool().connection() as connection, connection.cursor() as cursor:
         _recover_expired_items(cursor, parsed_id)
+        _refresh_stale_queued_deliveries(cursor, parsed_id)
         cursor.execute(
             """
             SELECT item_index,reference,queue_generation FROM dim_job_items
             WHERE job_id=%s AND status='queued'
-              AND (queue_attempted_at IS NULL OR queue_attempted_at < NOW()-INTERVAL '5 minutes')
+              AND queue_attempted_at IS NULL
             ORDER BY item_index
             """,
             (parsed_id,),
@@ -162,7 +195,7 @@ def enqueue_job(job_id: str) -> None:
         pending = list(cursor.fetchall())
 
     if not pending:
-        return
+        return 0
     queue = _queue_client()
     semaphore = asyncio.Semaphore(5)
 
@@ -185,8 +218,10 @@ def enqueue_job(job_id: str) -> None:
         return list(await asyncio.gather(*(publish(item) for item in pending)))
 
     outcomes = asyncio.run(publish_all()) if pending else []
+    failed_dispatches = 0
     for item_index, last_error in outcomes:
         if last_error is not None:
+            failed_dispatches += 1
             logger.error(
                 "Queue publish failed for job %s item %s (%s)",
                 job_id, item_index, type(last_error).__name__,
@@ -194,8 +229,10 @@ def enqueue_job(job_id: str) -> None:
             _set_enqueue_attempt(parsed_id, item_index, _safe_error_message(str(last_error)))
         else:
             _set_enqueue_attempt(parsed_id, item_index, None)
+    return failed_dispatches
 
 
+@_retry_database_operation
 def _set_enqueue_attempt(job_id: UUID, item_index: int, error: str | None) -> None:
     safe_error = _safe_error_message(error) if error else None
     with _connection_pool().connection() as connection, connection.cursor() as cursor:
@@ -203,10 +240,15 @@ def _set_enqueue_attempt(job_id: UUID, item_index: int, error: str | None) -> No
             "UPDATE dim_job_items SET queue_attempted_at=NOW(),error=%s,updated_at=NOW() WHERE job_id=%s AND item_index=%s AND status='queued'",
             (safe_error, job_id, item_index),
         )
-        cursor.execute("UPDATE dim_jobs SET last_error=%s WHERE id=%s", (safe_error, job_id))
-        _refresh_job(cursor, job_id)
+        # Successful queue publication needs no job-row write: it is not a
+        # state transition, and the worker will update the aggregate when it
+        # claims/completes the item. Avoiding this UPDATE lowers lock overlap
+        # between bursty Wix status polling and worker completions.
+        if safe_error and cursor.rowcount:
+            _refresh_job(cursor, job_id)
 
 
+@_retry_database_operation
 def claim_item(job_id: str, item_index: int) -> dict[str, Any] | None:
     """Claim a queue delivery once, with a lease to avoid duplicate execution."""
     ensure_jobs_schema()
@@ -247,6 +289,7 @@ def claim_item(job_id: str, item_index: int) -> dict[str, Any] | None:
         return None
 
 
+@_retry_database_operation
 def complete_item(job_id: str, item_index: int, result: dict[str, Any]) -> None:
     parsed_id = UUID(job_id)
     state = "completed" if result.get("estado") == "Exito" else "not_found"
@@ -261,6 +304,7 @@ def complete_item(job_id: str, item_index: int, result: dict[str, Any]) -> None:
         _refresh_job(cursor, parsed_id)
 
 
+@_retry_database_operation
 def retry_or_fail_item(job_id: str, item_index: int, error: str, terminal: bool) -> None:
     parsed_id = UUID(job_id)
     safe_error = _safe_error_message(error)
@@ -271,10 +315,10 @@ def retry_or_fail_item(job_id: str, item_index: int, error: str, terminal: bool)
             "UPDATE dim_job_items SET status=%s,error=%s,result=COALESCE(%s,result),lease_until=NULL,updated_at=NOW() WHERE job_id=%s AND item_index=%s",
             (status, safe_error, result, parsed_id, item_index),
         )
-        cursor.execute("UPDATE dim_jobs SET last_error=%s WHERE id=%s", (safe_error, parsed_id))
         _refresh_job(cursor, parsed_id)
 
 
+@_retry_database_operation
 def retry_failed_items(job_id: str) -> int:
     """Reset terminal items and advance their queue idempotency generation."""
     ensure_jobs_schema()
@@ -296,6 +340,7 @@ def retry_failed_items(job_id: str) -> int:
         return count
 
 
+@_retry_database_operation
 def get_download_target(
     job_id: str, item_index: int, file_index: int, owner_email: str, is_admin: bool = False
 ) -> dict[str, str] | None:
@@ -327,6 +372,7 @@ def get_download_target(
     return {"driveItemId": drive_item_id, "driveBase": drive_base, "name": filename}
 
 
+@_retry_database_operation
 def list_failed_jobs(limit: int = 50) -> list[dict[str, Any]]:
     ensure_jobs_schema()
     bounded_limit = max(1, min(int(limit), 100))
@@ -353,6 +399,7 @@ def list_failed_jobs(limit: int = 50) -> list[dict[str, Any]]:
     ]
 
 
+@_retry_database_operation
 def get_job(job_id: str, owner_email: str, is_admin: bool = False) -> dict[str, Any] | None:
     ensure_jobs_schema()
     try:
@@ -368,7 +415,8 @@ def get_job(job_id: str, owner_email: str, is_admin: bool = False) -> dict[str, 
         if not job:
             return None
         cursor.execute(
-            "SELECT item_index,reference,status,attempts,result,error FROM dim_job_items WHERE job_id=%s ORDER BY item_index",
+            "SELECT item_index,reference,status,attempts,result,error,updated_at "
+            "FROM dim_job_items WHERE job_id=%s ORDER BY item_index",
             (parsed_id,),
         )
         items = list(cursor.fetchall())
@@ -387,6 +435,7 @@ def get_job(job_id: str, owner_email: str, is_admin: bool = False) -> dict[str, 
                 "referencia": "PDF maestro" if job["job_type"] == "split_pdf" else item["reference"],
                 "estado": item["result"].get("estado") if item["result"] else item["status"],
                 "attempts": int(item["attempts"]),
+                "updatedAt": item["updated_at"].isoformat(),
                 "nombre_pdf": item["result"].get("nombre_pdf") if item["result"] else None,
                 "numeroFormulario": item["result"].get("numeroFormulario") if item["result"] else None,
                 "downloadUrl": (

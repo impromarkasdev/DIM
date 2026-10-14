@@ -14,8 +14,8 @@ import { local, session } from 'wix-storage';
 import wixLocation from 'wix-location';
 
 const PENDING_JOB_KEY = 'dim_admin_pending_job';
-const POLL_INTERVAL_MS = 2500;
-const MAX_POLL_MS = 5 * 60 * 1000;
+const POLL_INTERVAL_MS = 4000;
+const MAX_POLL_MS = 10 * 60 * 1000;
 const MAX_REFERENCES = 30;
 
 let currentUsersList = [];
@@ -161,10 +161,12 @@ $w.onReady(async function () {
 
         $w('#btnSplit').disable();
         $w('#txtSplitStatus').text = 'Solicitud recibida. Preparando la separación…';
+        const fingerprint = filePath.trim().toLowerCase();
+        const idempotencyKey = getSubmissionKey('split', fingerprint);
         try {
-            const accepted = await startSplitJob(token, filePath, makeIdempotencyKey('split'));
+            const accepted = await startSplitJob(token, filePath, idempotencyKey);
             if (!accepted.jobId) throw new Error('El servicio no devolvió el identificador del trabajo.');
-            savePendingJob({ type: 'split', jobId: accepted.jobId });
+            savePendingJob({ type: 'split', jobId: accepted.jobId, fingerprint, idempotencyKey });
             await pollAndDisplayJob(token, { type: 'split', jobId: accepted.jobId });
         } catch (error) {
             console.error('Error al iniciar la separación:', error);
@@ -189,10 +191,12 @@ $w.onReady(async function () {
 
         $w('#btnRedact').disable();
         $w('#txtRedactStatus').text = `Solicitud recibida. Progreso: 0 de ${references.length} referencias…`;
+        const fingerprint = references.map(value => value.toUpperCase()).sort().join('|');
+        const idempotencyKey = getSubmissionKey('redact', fingerprint);
         try {
-            const accepted = await startRedactionJob(token, references, makeIdempotencyKey('redact'));
+            const accepted = await startRedactionJob(token, references, idempotencyKey);
             if (!accepted.jobId) throw new Error('El servicio no devolvió el identificador del trabajo.');
-            savePendingJob({ type: 'redact', jobId: accepted.jobId });
+            savePendingJob({ type: 'redact', jobId: accepted.jobId, fingerprint, idempotencyKey });
             await pollAndDisplayJob(token, { type: 'redact', jobId: accepted.jobId });
         } catch (error) {
             console.error('Error al consultar referencias:', error);
@@ -279,9 +283,11 @@ async function pollAndDisplayJob(token, pending) {
                     terminalJob = job;
                     break;
                 }
-                setJobStatus(pending.type, job.total
-                    ? `Procesando la solicitud (${Number(job.completed || 0)} de ${Number(job.total)})…`
-                    : 'Procesando la solicitud…');
+                setJobStatus(pending.type, job.queueDispatchPending
+                    ? `Solicitud guardada. La cola aún no confirma el envío (${Number(job.completed || 0)} de ${Number(job.total || 0)}); se reintentará automáticamente…`
+                    : job.total
+                        ? `Procesando la solicitud (${Number(job.completed || 0)} de ${Number(job.total)})…`
+                        : 'Procesando la solicitud…');
             } catch (error) {
                 if ([401, 403, 404].includes(error.httpStatus)) throw error;
                 consecutiveErrors += 1;
@@ -290,7 +296,7 @@ async function pollAndDisplayJob(token, pending) {
             }
         }
         if (!terminalJob) {
-            setJobStatus(pending.type, 'La solicitud continúa en segundo plano. No la vuelvas a enviar; consulta nuevamente en unos momentos.');
+            setJobStatus(pending.type, `La solicitud continúa en segundo plano (seguimiento ${pending.jobId}). No la envíes de nuevo; consulta nuevamente en unos momentos.`);
             return;
         }
         if (pending.type === 'redact' && hasSuccessWithoutLink(terminalJob)) {
@@ -360,17 +366,26 @@ async function displayRedactionResult(token, job) {
         $w('#btnDownloadAdmin').link = downloadUrl;
         $w('#btnDownloadAdmin').target = '_blank';
         $w('#btnDownloadAdmin').show();
-        const missing = results.length - successful.length;
+        const notFound = results.filter(item => item?.estado === 'Pendiente (No encontrado)').length;
+        const failed = results.filter(item => item?.estado === 'Error' || item?.estado === 'failed').length;
+        const exceptions = [
+            notFound ? `No se encontró documento para ${notFound} referencia(s).` : '',
+            failed ? `${failed} referencia(s) requieren revisión por error de procesamiento.` : ''
+        ].filter(Boolean).join(' ');
         $w('#txtRedactStatus').text = successful.length === 1
-            ? `Consulta completada. ${downloadName} está listo para descargar.${missing ? ` No se encontró documento para ${missing} referencia(s).` : ''}`
+            ? `Consulta completada. ${downloadName} está listo para descargar. ${exceptions}`.trim()
             : combined
-                ? `Consulta completada: ${uniqueDeclarationCount} declaración(es) única(s) en un PDF, para ${successful.length} referencia(s).${missing ? ` No se encontró documento para ${missing} referencia(s).` : ''}`
-                : `Se procesaron ${successful.length} documentos, pero no fue posible unificarlos. El botón descarga el primero; intenta nuevamente para generar el combinado.${missing ? ` No se encontró documento para ${missing} referencia(s).` : ''}`;
+                ? `Consulta completada: ${uniqueDeclarationCount} declaración(es) única(s) en un PDF, para ${successful.length} referencia(s). ${exceptions}`.trim()
+                : `Se procesaron ${successful.length} documentos, pero no fue posible unificarlos. El botón descarga el primero; intenta nuevamente para generar el combinado. ${exceptions}`.trim();
         local.removeItem(PENDING_JOB_KEY);
         return;
     }
     if (['failed', 'partial'].includes(String(job.status || '').toLowerCase())) {
-        $w('#txtRedactStatus').text = results.find(item => item?.detalle)?.detalle || job.lastError || 'La consulta terminó con errores.';
+        const failedCount = results.filter(item => item?.estado === 'Error' || item?.estado === 'failed').length;
+        const detail = results.find(item => item?.detalle)?.detalle || job.lastError;
+        $w('#txtRedactStatus').text = failedCount
+            ? `${failedCount} referencia(s) no pudieron procesarse. ${detail || 'Revisa el detalle del trabajo e inténtalo de nuevo.'}`
+            : detail || 'La consulta terminó con errores.';
         local.removeItem(PENDING_JOB_KEY);
         return;
     }
@@ -411,6 +426,18 @@ function readPendingJob() {
 
 function savePendingJob(job) {
     local.setItem(PENDING_JOB_KEY, JSON.stringify(job));
+}
+
+function getSubmissionKey(type, fingerprint) {
+    const previous = readPendingJob();
+    if (previous?.type === type && previous?.fingerprint === fingerprint && previous?.idempotencyKey) {
+        return previous.idempotencyKey;
+    }
+    const idempotencyKey = makeIdempotencyKey(type);
+    // Persist before the network call. If Wix times out after the API has
+    // committed the durable job, retrying these same inputs reuses the key.
+    savePendingJob({ type, jobId: '', fingerprint, idempotencyKey });
+    return idempotencyKey;
 }
 
 function makeIdempotencyKey(prefix) {

@@ -48,9 +48,19 @@ class handler(ApiHandler):
             job_id, created = create_job(
                 owner_email, normalized_references, normalized_terms, idempotency_key
             )
-            # Re-publishing queued items is safe: every message has a stable
-            # Vercel Queue idempotency key derived from the persisted job/item.
-            enqueue_job(job_id)
+            # The job is already durable in Neon. A transient queue/bookkeeping
+            # error must not hide its ID or make Wix create a second job; the
+            # status endpoint will retry dispatch from the same durable outbox.
+            queue_dispatch_pending = False
+            try:
+                queue_dispatch_pending = enqueue_job(job_id) > 0
+            except Exception:
+                queue_dispatch_pending = True
+                logger.exception("Initial queue dispatch failed for durable DIM job %s", job_id)
+            logger.info(
+                "DIM redaction job accepted: job=%s references=%s created=%s queue_dispatch_pending=%s",
+                job_id, len(normalized_references), created, queue_dispatch_pending,
+            )
             job = get_job(job_id, owner_email)
             if not job:
                 raise RuntimeError("No fue posible recuperar el trabajo recién creado")
@@ -62,7 +72,12 @@ class handler(ApiHandler):
                 "completed": job["completed"],
                 "statusUrl": f"/api/documents/jobs?jobId={job_id}",
                 "created": created,
-                "message": "Solicitud recibida para procesamiento seguro.",
+                "queueDispatchPending": queue_dispatch_pending,
+                "message": (
+                    "La solicitud quedó guardada y se reintentará su envío a la cola."
+                    if queue_dispatch_pending
+                    else "Solicitud recibida para procesamiento seguro."
+                ),
             })
         except AuthenticationError:
             self.respond(401, {"success": False, "message": "La sesión no es válida o expiró."})

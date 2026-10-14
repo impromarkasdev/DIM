@@ -28,20 +28,26 @@ T = TypeVar("T")
 
 
 def _retry_database_operation(function: Callable[..., T]) -> Callable[..., T]:
-    """Retry idempotent DB operations after stale pooled-connection failures."""
+    """Retry idempotent operations after transient DB and transaction failures."""
     @wraps(function)
     def wrapped(*args: Any, **kwargs: Any) -> T:
         for attempt in range(3):
             try:
                 return function(*args, **kwargs)
-            except (psycopg.OperationalError, psycopg.InterfaceError, PoolTimeout) as exc:
+            except (
+                psycopg.OperationalError,
+                psycopg.InterfaceError,
+                psycopg.errors.DeadlockDetected,
+                psycopg.errors.SerializationFailure,
+                PoolTimeout,
+            ) as exc:
                 if attempt == 2:
                     logger.exception("Database unavailable during %s", function.__name__)
                     raise RuntimeError("Database temporarily unavailable; please retry") from exc
                 delay = 0.2 * (2 ** attempt)
                 logger.warning(
-                    "Database connection failed during %s; retry %s/3 in %.1fs",
-                    function.__name__, attempt + 2, delay,
+                    "Transient database failure during %s (%s); retry %s/3 in %.1fs",
+                    function.__name__, type(exc).__name__, attempt + 2, delay,
                 )
                 time.sleep(delay)
         raise RuntimeError("Database temporarily unavailable; please retry")
@@ -75,6 +81,7 @@ def _connection_pool() -> ConnectionPool:
 
 
 def ensure_schema() -> None:
+    """Read-only production preflight; schema DDL belongs in scripts/migrate_db.py."""
     global _schema_ready
     if _schema_ready:
         return
@@ -82,40 +89,20 @@ def ensure_schema() -> None:
         if _schema_ready:
             return
         with _connection_pool().connection() as connection, connection.cursor() as cursor:
-            cursor.execute("CREATE TABLE IF NOT EXISTS app_users (email TEXT PRIMARY KEY, password_hash TEXT NOT NULL, role TEXT NOT NULL CHECK(role IN ('admin','client')), active BOOLEAN NOT NULL DEFAULT TRUE, created_at TIMESTAMPTZ NOT NULL DEFAULT NOW())")
-            # Online migration: existing installations previously used email as the key.
-            cursor.execute("ALTER TABLE app_users ADD COLUMN IF NOT EXISTS id TEXT")
-            cursor.execute("SELECT email FROM app_users WHERE id IS NULL")
-            for row in cursor.fetchall():
-                cursor.execute("UPDATE app_users SET id=%s WHERE email=%s", (str(uuid4()), row["email"]))
-            cursor.execute("CREATE UNIQUE INDEX IF NOT EXISTS app_users_id_key ON app_users(id)")
             cursor.execute(
-                """
-                CREATE TABLE IF NOT EXISTS auth_login_attempts (
-                    email_hash TEXT PRIMARY KEY,
-                    attempts INTEGER NOT NULL DEFAULT 0,
-                    window_started_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
-                    blocked_until TIMESTAMPTZ
-                )
-                """
+                "SELECT to_regclass('public.app_users') AS users, "
+                "to_regclass('public.auth_login_attempts') AS login_attempts"
             )
-            cursor.execute(
-                "CREATE INDEX IF NOT EXISTS auth_login_attempts_window_idx ON auth_login_attempts(window_started_at)"
-            )
-            cursor.execute("SELECT COUNT(*) AS count FROM app_users")
-            if cursor.fetchone()["count"] == 0:
-                email, password = os.getenv("ADMIN_EMAIL", ""), os.getenv("ADMIN_INITIAL_PASSWORD", "")
-                if not email or not password:
-                    raise RuntimeError("Set ADMIN_EMAIL and ADMIN_INITIAL_PASSWORD to bootstrap the first admin")
-                cursor.execute(
-                    "INSERT INTO app_users (id,email,password_hash,role) VALUES (%s,%s,%s,'admin') ON CONFLICT (email) DO NOTHING",
-                    (str(uuid4()), email.lower(), hash_password(password)),
+            tables = cursor.fetchone()
+            if not tables or not tables["users"] or not tables["login_attempts"]:
+                raise RuntimeError(
+                    "Database schema is not initialized; run scripts/migrate_db.py before serving traffic"
                 )
         _schema_ready = True
 
 
 def ensure_jobs_schema() -> None:
-    """Initialize asynchronous-job storage independently from login tables."""
+    """Read-only preflight for durable jobs; never run DDL inside a request."""
     global _jobs_schema_ready
     if _jobs_schema_ready:
         return
@@ -124,58 +111,14 @@ def ensure_jobs_schema() -> None:
             return
         with _connection_pool().connection() as connection, connection.cursor() as cursor:
             cursor.execute(
-                """
-                CREATE TABLE IF NOT EXISTS dim_jobs (
-                    id UUID PRIMARY KEY,
-                    owner_email TEXT NOT NULL,
-                    idempotency_key TEXT,
-                    job_type TEXT NOT NULL DEFAULT 'redact',
-                    status TEXT NOT NULL DEFAULT 'queued',
-                    total INTEGER NOT NULL,
-                    completed INTEGER NOT NULL DEFAULT 0,
-                    failed INTEGER NOT NULL DEFAULT 0,
-                    payload JSONB NOT NULL DEFAULT '{}'::jsonb,
-                    created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
-                    updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
-                    last_error TEXT
+                "SELECT to_regclass('public.dim_jobs') AS jobs, "
+                "to_regclass('public.dim_job_items') AS items"
+            )
+            tables = cursor.fetchone()
+            if not tables or not tables["jobs"] or not tables["items"]:
+                raise RuntimeError(
+                    "Document-job schema is not initialized; run scripts/migrate_db.py before serving traffic"
                 )
-                """
-            )
-            cursor.execute(
-                "ALTER TABLE dim_jobs ADD COLUMN IF NOT EXISTS job_type TEXT NOT NULL DEFAULT 'redact'"
-            )
-            cursor.execute(
-                "CREATE UNIQUE INDEX IF NOT EXISTS dim_jobs_owner_idempotency_key ON dim_jobs(owner_email,idempotency_key) WHERE idempotency_key IS NOT NULL"
-            )
-            cursor.execute(
-                """
-                CREATE TABLE IF NOT EXISTS dim_job_items (
-                    id UUID PRIMARY KEY,
-                    job_id UUID NOT NULL REFERENCES dim_jobs(id) ON DELETE CASCADE,
-                    item_index INTEGER NOT NULL,
-                    reference TEXT NOT NULL,
-                    status TEXT NOT NULL DEFAULT 'queued',
-                    attempts INTEGER NOT NULL DEFAULT 0,
-                    queue_generation INTEGER NOT NULL DEFAULT 0,
-                    queue_attempted_at TIMESTAMPTZ,
-                    lease_until TIMESTAMPTZ,
-                    result JSONB,
-                    error TEXT,
-                    created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
-                    updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
-                    UNIQUE(job_id,item_index)
-                )
-                """
-            )
-            cursor.execute(
-                "ALTER TABLE dim_job_items ADD COLUMN IF NOT EXISTS queue_attempted_at TIMESTAMPTZ"
-            )
-            cursor.execute(
-                "ALTER TABLE dim_job_items ADD COLUMN IF NOT EXISTS queue_generation INTEGER NOT NULL DEFAULT 0"
-            )
-            cursor.execute(
-                "CREATE INDEX IF NOT EXISTS dim_job_items_job_status ON dim_job_items(job_id,status,item_index)"
-            )
         _jobs_schema_ready = True
 
 

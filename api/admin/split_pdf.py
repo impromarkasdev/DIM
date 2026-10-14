@@ -40,7 +40,16 @@ class handler(ApiHandler):
                 job_type="split_pdf",
                 job_metadata={"file_path": file_path},
             )
-            enqueue_job(job_id)
+            queue_dispatch_pending = False
+            try:
+                queue_dispatch_pending = enqueue_job(job_id) > 0
+            except Exception:
+                queue_dispatch_pending = True
+                logger.exception("Initial queue dispatch failed for durable split job %s", job_id)
+            logger.info(
+                "PDF split job accepted: job=%s created=%s queue_dispatch_pending=%s",
+                job_id, created, queue_dispatch_pending,
+            )
             job = get_job(job_id, owner_email, is_admin=True)
             if not job:
                 raise RuntimeError("No fue posible recuperar el trabajo recién creado")
@@ -53,7 +62,12 @@ class handler(ApiHandler):
                 "completed": 0,
                 "statusUrl": f"/api/documents/jobs?jobId={job_id}",
                 "created": created,
-                "message": "El PDF se recibió y se separará en segundo plano.",
+                "queueDispatchPending": queue_dispatch_pending,
+                "message": (
+                    "La separación quedó guardada y se reintentará su envío a la cola."
+                    if queue_dispatch_pending
+                    else "El PDF se recibió y se separará en segundo plano."
+                ),
             })
         except AuthenticationError:
             self.respond(401, {"success": False, "message": "La sesión no es válida o expiró."})

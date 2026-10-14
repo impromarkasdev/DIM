@@ -4,7 +4,7 @@
 
 `POST /api/documents/process-redact` y `POST /api/admin/split-pdf` ya no esperan a que Graph termine. Validan y guardan el trabajo y sus ítems en Neon, publican cada ítem en Vercel Queues y responden `202 Accepted` con `jobId`. Wix consulta `GET /api/documents/jobs?jobId=<uuid>` con el mismo JWT hasta que `status` sea `completed`, `partial` o `failed`. Cada referencia o separación se procesa de forma independiente y la cola vuelve a entregar automáticamente mensajes cuyo consumidor falle. El consumidor es privado y está declarado en `app.queue_worker`.
 
-Neon es la fuente durable del estado y Vercel Queues es el transporte durable de ejecución. Las tablas `dim_jobs` y `dim_job_items` se crean/migran de forma idempotente al enviar el primer trabajo. No se necesita un Cron para despertar los trabajos.
+Neon es la fuente durable del estado y Vercel Queues es el transporte durable de ejecución. Los endpoints no ejecutan `CREATE`/`ALTER TABLE`: en un despliegue Serverless varias instancias pueden arrancar a la vez y las migraciones en caliente pueden bloquear o generar deadlocks con las solicitudes. El esquema se prepara explícitamente con `python scripts/migrate_db.py` desde un entorno confiable con `POSTGRES_URL`; si la tabla de usuarios está vacía, también requiere `ADMIN_EMAIL` y `ADMIN_INITIAL_PASSWORD`. El script toma un advisory lock transaccional para serializar migraciones. En producción, ejecutar migraciones antes de desplegar código que necesite nuevas columnas, idealmente en una ventana de bajo tráfico. No se necesita un Cron para despertar los trabajos.
 
 ### Contrato de API asíncrona
 
@@ -96,7 +96,7 @@ Operación de fallos: `GET /api/admin/jobs` lista trabajos con elementos fallido
 
 OCR en Vercel: define `AZURE_DOCUMENT_INTELLIGENCE_ENDPOINT` y `AZURE_DOCUMENT_INTELLIGENCE_KEY`. Sólo si el texto seleccionable no permite reconocer Campo 4, el worker construye un PDF temporal con los recortes de esa casilla y los envía al modelo `prebuilt-read` de Azure Document Intelligence en una sola operación; las páginas completas no se envían. Revisa privacidad, región y precio del recurso Azure. `pytesseract` es sólo una alternativa local y requiere que el ejecutable Tesseract esté instalado en ese equipo.
 
-Duración del worker: `vercel.json` configura hasta 300 segundos para `app/queue_worker.py`; la API de recepción permanece en 60 segundos. Tras desplegar, confirma en el resumen del build que el suscriptor `app.queue_worker` quedó registrado y verifica en el detalle de funciones el límite efectivo del worker. Los máximos disponibles dependen de plan y configuración de Fluid Compute.
+Duración del worker: `vercel.json` configura hasta 300 segundos para `app/queue_worker.py`; la API de recepción permanece en 60 segundos. El suscriptor procesa hasta cinco referencias concurrentes; Graph 429/5xx se reintenta con backoff, por lo que una limitación de Microsoft no se informa falsamente como “no encontrado”. Tras desplegar, confirma en el resumen del build que el suscriptor `app.queue_worker` quedó registrado y verifica en el detalle de funciones el límite efectivo del worker. Los máximos disponibles dependen de plan y configuración de Fluid Compute.
 
 Ejemplo de polling para una página Velo (el estado y los archivos se actualizan sin mover los controles):
 

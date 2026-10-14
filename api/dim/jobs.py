@@ -64,11 +64,22 @@ class handler(ApiHandler):
                 return
             # Database state is the durable outbox. If the initial publisher
             # was interrupted, polling the job retries unsent queue messages.
-            enqueue_job(job_id)
+            queue_dispatch_pending = False
+            try:
+                queue_dispatch_pending = enqueue_job(job_id) > 0
+            except Exception:
+                # Status reads must remain available even when a queue
+                # publication or its bookkeeping hits a transient DB error.
+                queue_dispatch_pending = True
+                logger.exception("Queue redispatch failed while reading DIM job %s", job_id)
             job = get_job(job_id, owner_email, is_admin=is_admin)
             if job and job["status"] in {"completed", "partial"}:
                 _refresh_download_links(job, job_id, owner_email, is_admin)
-            self.respond(200, {"success": True, **job})
+            self.respond(200, {
+                "success": True,
+                **job,
+                "queueDispatchPending": queue_dispatch_pending,
+            })
         except AuthenticationError:
             self.respond(401, {"success": False, "message": "La sesión no es válida o expiró."})
         except PermissionError:

@@ -5,8 +5,7 @@ import wixLocation from 'wix-location';
 
 const JOB_CACHE_KEY = 'dim_last_job';
 const JOB_CACHE_MAX_AGE_MS = 6 * 60 * 60 * 1000;
-const JOB_POLL_ATTEMPTS = 60;
-const JOB_POLL_DELAY_MS = 1500;
+const JOB_POLL_TIMEOUT_MS = 8 * 60 * 1000;
 const MAX_REFERENCES = 30;
 
 let searchInProgress = false;
@@ -42,7 +41,7 @@ $w.onReady(function () {
         try {
             const job = await submitOrResumeRedaction(token, references);
             if (job.pending) {
-                setClientStatus('La solicitud sigue en proceso. No vuelvas a enviarla; consulta nuevamente en unos momentos.');
+                setClientStatus(`La solicitud continúa en segundo plano (seguimiento ${job.jobId}). No la envíes de nuevo; vuelve a consultar en unos momentos.`);
                 return;
             }
 
@@ -74,20 +73,29 @@ $w.onReady(function () {
                 $w('#btnDownloadClient').show();
 
                 saveJobCache(makeQueryKey(references), job.jobId);
-                const missing = results.length - successful.length;
+                const notFound = results.filter(item => item?.estado === 'Pendiente (No encontrado)').length;
+                const failed = results.filter(item => item?.estado === 'Error' || item?.estado === 'failed').length;
+                const exceptions = [
+                    notFound ? `No se encontró documento para ${notFound} referencia(s).` : '',
+                    failed ? `${failed} referencia(s) requieren revisión por un error de procesamiento.` : ''
+                ].filter(Boolean).join(' ');
                 setClientStatus(successful.length === 1
-                    ? `Consulta completada: 1 de ${references.length} documento(s) listo(s).${missing ? ` No se encontró documento para ${missing} referencia(s).` : ''}`
+                    ? `Consulta completada: 1 de ${references.length} documento(s) listo(s). ${exceptions}`.trim()
                     : combinedSucceeded
-                        ? `Consulta completada: ${uniqueDeclarationCount} declaración(es) única(s) unificada(s) en un PDF para ${successful.length} referencia(s).${missing ? ` No se encontró documento para ${missing} referencia(s).` : ''}`
-                        : `Se procesaron ${successful.length} documentos. El botón descarga el primero; no se pudo generar el combinado.${missing ? ` No se encontró documento para ${missing} referencia(s).` : ''}`);
+                        ? `Consulta completada: ${uniqueDeclarationCount} declaración(es) única(s) unificada(s) en un PDF para ${successful.length} referencia(s). ${exceptions}`.trim()
+                        : `Se procesaron ${successful.length} documentos. El botón descarga el primero; no se pudo generar el combinado. ${exceptions}`.trim());
                 return;
             }
 
             clearJobCache();
             const notFoundCount = results.filter(item => item?.estado === 'Pendiente (No encontrado)').length;
-            setClientStatus(notFoundCount
-                ? `El proceso terminó. No se encontró una declaración para ${notFoundCount} referencia(s).`
-                : 'El proceso terminó sin generar documentos descargables. Inténtalo nuevamente o contacta al administrador.');
+            const failedItems = results.filter(item => item?.estado === 'Error' || item?.estado === 'failed');
+            const detail = failedItems.find(item => item?.detalle)?.detalle || job.lastError;
+            setClientStatus(failedItems.length
+                ? `${failedItems.length} referencia(s) no pudieron procesarse. ${detail || 'El administrador puede revisar el detalle del trabajo.'}`
+                : notFoundCount
+                    ? `El proceso terminó. No se encontró una declaración para ${notFoundCount} referencia(s).`
+                    : 'El proceso terminó sin generar documentos descargables. Inténtalo nuevamente o contacta al administrador.');
         } catch (error) {
             console.error('Error al consultar referencias:', error);
             setClientStatus(error.message || 'No fue posible completar la consulta. Inténtalo nuevamente.');
@@ -133,20 +141,26 @@ async function submitOrResumeRedaction(token, references) {
 }
 
 async function waitForJob(token, jobId, requestedTotal) {
-    for (let attempt = 0; attempt < JOB_POLL_ATTEMPTS; attempt += 1) {
+    const deadline = Date.now() + JOB_POLL_TIMEOUT_MS;
+    let delayMs = 2000;
+    while (Date.now() < deadline) {
         const job = await getDocumentJobStatus(token, jobId);
         if (!job.success) {
             if ([429, 502, 503, 504].includes(job.httpStatus)) {
-                await delay(JOB_POLL_DELAY_MS);
+                await delay(delayMs);
+                delayMs = Math.min(5000, delayMs + 500);
                 continue;
             }
             throw new Error(job.message || 'No fue posible consultar el trabajo.');
         }
         const total = Number(job.total || requestedTotal || 0);
         const completed = Number(job.completed || 0);
-        setClientStatus(`Progreso: ${Math.min(completed, total)} de ${total} referencias procesadas…`);
+        setClientStatus(job.queueDispatchPending
+            ? `Progreso: ${Math.min(completed, total)} de ${total}. La cola aún no confirma los pendientes; se reintentará automáticamente…`
+            : `Progreso: ${Math.min(completed, total)} de ${total} referencias procesadas…`);
         if (isTerminal(job.status)) return job;
-        await delay(JOB_POLL_DELAY_MS);
+        await delay(delayMs);
+        delayMs = Math.min(5000, delayMs + 500);
     }
     return { success: false, pending: true, jobId };
 }

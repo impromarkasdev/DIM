@@ -34,6 +34,15 @@ $w.onReady(async function () {
     $w('#txtSplitStatus').text = '';
     $w('#txtRedactStatus').text = '';
 
+    // Contraseña de creación: mostrar/ocultar sin cambiar el valor ingresado.
+    $w('#inputNewPass').inputType = 'password';
+    $w('#btnToggleNewPass').label = 'Mostrar';
+    $w('#btnToggleNewPass').onClick(() => {
+        const isHidden = $w('#inputNewPass').inputType === 'password';
+        $w('#inputNewPass').inputType = isHidden ? 'text' : 'password';
+        $w('#btnToggleNewPass').label = isHidden ? 'Ocultar' : 'Mostrar';
+    });
+
     $w('#tableUsers').columns = [
         { id: 'col1', dataPath: 'displayId', label: 'ID', type: 'string', width: 70 },
         { id: 'col2', dataPath: 'email', label: 'Correo electrónico', type: 'string', width: 250 },
@@ -63,6 +72,8 @@ $w.onReady(async function () {
             await createUser(token, { email, password, role: 'client', active: true });
             $w('#inputNewEmail').value = '';
             $w('#inputNewPass').value = '';
+            $w('#inputNewPass').inputType = 'password';
+            $w('#btnToggleNewPass').label = 'Mostrar';
             setUserStatus('La cuenta se creó correctamente.');
             await loadUsersTable(token);
         } catch (error) {
@@ -108,12 +119,12 @@ $w.onReady(async function () {
         const value = String($w('#inputPasswordUserId').value || '').trim();
         const newPassword = String($w('#inputChangeUserPassword').value || '');
         if (!value) {
-            setUserStatus('Ingresa el número de fila, correo o ID del cliente.');
+            setUserStatus('Ingresa el número que aparece en la columna ID de la tabla.');
             return;
         }
         const selectedUser = resolveUser(value);
         if (/^\d+$/.test(value) && !selectedUser) {
-            setUserStatus('Ese número de fila ya no corresponde a la lista actual. Actualiza la tabla.');
+            setUserStatus('Ese número ya no corresponde a la lista actual. Actualiza la tabla.');
             return;
         }
         if (selectedUser?.role === 'admin') {

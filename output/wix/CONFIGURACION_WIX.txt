@@ -12,9 +12,11 @@ Página Declaraciones:
 - Añade un botón #btnTogglePassword con texto inicial “Mostrar”, junto al campo.
 
 Admin Dashboard:
-- Añade un Text Input de contraseña #inputChangeUserPassword.
+- Conserva la tabla de usuarios con la columna ID numérica (1, 2, 3…). Ese número visible sirve para seleccionar al usuario; el código lo relaciona con el ID interno real.
+- Añade un Text Input #inputChangeUserPassword, configurado como contraseña, para escribir la nueva contraseña de la cuenta seleccionada.
 - Añade un botón #btnChangeUserPassword.
-- El campo para identificar al usuario cuyo password cambiar debe tener ID #inputPasswordUserId; el campo de eliminación conserva #inputDeleteUserId.
+- El campo para identificar al usuario cuyo password cambiar debe tener ID #inputPasswordUserId. Escribe ahí el número de la columna ID, luego la nueva contraseña en #inputChangeUserPassword y pulsa #btnChangeUserPassword. El campo de eliminación conserva #inputDeleteUserId.
+- Junto al campo de creación de contraseña #inputNewPass, añade un botón #btnToggleNewPass con texto inicial “Mostrar”. Al pulsarlo alterna entre mostrar y ocultar lo escrito; no envía ni guarda la contraseña por sí mismo.
 - Convierte el campo actual de referencias #inputRedactRefs a Text Box multilínea; conserva el mismo ID.
 - No se necesita un repetidor: se conserva el botón de descarga actual. Si hay varios resultados, Vercel los combina en un solo PDF.
 

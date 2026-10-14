@@ -113,11 +113,43 @@ def _refresh_job(cursor: Any, job_id: UUID) -> None:
     )
 
 
+def _recover_expired_items(cursor: Any, job_id: UUID) -> int:
+    """Return abandoned worker leases to the durable outbox exactly once.
+
+    The worker execution limit is shorter than the eight-minute lease. If a
+    serverless invocation is terminated before it can acknowledge/retry its
+    queue message, Vercel may eventually stop redelivering it while Neon still
+    says ``processing``. A status poll can safely recover that item: claim_item
+    performs an atomic status transition, so a late duplicate delivery cannot
+    process the same item concurrently.
+    """
+    cursor.execute(
+        """
+        UPDATE dim_job_items
+        SET status='queued', queue_generation=queue_generation+1,
+            queue_attempted_at=NULL, lease_until=NULL,
+            error='La ejecución anterior terminó sin confirmar el resultado; se reintentará automáticamente.',
+            updated_at=NOW()
+        WHERE job_id=%s AND status='processing' AND lease_until IS NOT NULL
+          AND lease_until < NOW()
+        RETURNING job_id
+        """,
+        (job_id,),
+    )
+    recovered_rows = cursor.fetchall()
+    recovered_job_ids = {row["job_id"] for row in recovered_rows}
+    for recovered_job_id in recovered_job_ids:
+        logger.warning("Recovered expired document-processing lease for job %s", recovered_job_id)
+        _refresh_job(cursor, recovered_job_id)
+    return len(recovered_rows)
+
+
 def enqueue_job(job_id: str) -> None:
     """Publish each reference independently; Queue delivery is at-least-once."""
     ensure_jobs_schema()
     parsed_id = UUID(job_id)
     with _connection_pool().connection() as connection, connection.cursor() as cursor:
+        _recover_expired_items(cursor, parsed_id)
         cursor.execute(
             """
             SELECT item_index,reference,queue_generation FROM dim_job_items

@@ -326,6 +326,23 @@ class QueueConfigurationTests(unittest.TestCase):
         self.assertEqual(len(worker_subscriptions), 1)
         self.assertEqual(worker_subscriptions[0].topic, "dim-redaction")
 
+    def test_expired_processing_lease_is_requeued_with_new_generation(self) -> None:
+        from uuid import uuid4
+        from app.jobs import _recover_expired_items
+
+        job_id = uuid4()
+        cursor = unittest.mock.MagicMock()
+        cursor.fetchall.return_value = [{"job_id": job_id}, {"job_id": job_id}]
+        with patch("app.jobs._refresh_job") as refresh_job:
+            recovered = _recover_expired_items(cursor, job_id)
+
+        self.assertEqual(recovered, 2)
+        statement = cursor.execute.call_args.args[0]
+        self.assertIn("status='queued'", statement)
+        self.assertIn("queue_generation=queue_generation+1", statement)
+        self.assertIn("lease_until < NOW()", statement)
+        refresh_job.assert_called_once_with(cursor, job_id)
+
 
 class RedactionSafetyTests(unittest.TestCase):
     def test_missing_field_template_is_a_permanent_fail_closed_error(self) -> None:

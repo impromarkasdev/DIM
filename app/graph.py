@@ -448,27 +448,23 @@ class GraphClient:
             if cache_key in self._ensured_folders:
                 continue
 
-            # Avoid POSTing an already existing folder on every request. Apart
-            # from reducing Graph traffic, this prevents routine 409 conflicts
-            # from looking like failed PDF processing in Vercel logs.
             parent = current.rsplit("/", 1)[0] if "/" in current else ""
             try:
-                children = self.list_children(parent, drive_base)
-                existing = next(
-                    (
-                        item for item in children
-                        if item.get("folder") is not None
-                        and str(item.get("name", "")).casefold() == segment.casefold()
-                    ),
-                    None,
-                )
-                if existing:
-                    self._ensured_folders.add(cache_key)
-                    continue
-            except RuntimeError:
-                # The following create call gives a clearer, definitive error
-                # if listing was denied or the parent path is unavailable.
-                logger.warning("Could not verify whether Graph folder exists; attempting create")
+                encoded_current = quote(current, safe="/")
+                existing = self._request(
+                    "GET",
+                    f"{drive_base}/root:/{encoded_current}?$select=id,name,folder,parentReference",
+                ).json()
+                if existing.get("folder") is None:
+                    raise RuntimeError("A file already exists at the requested folder path")
+                self._ensured_folders.add(cache_key)
+                continue
+            except RuntimeError as exc:
+                # A directory listing can paginate through tens of thousands
+                # of siblings. Resolve the exact path instead, and create only
+                # when Graph explicitly reports that this item is missing.
+                if not str(exc).startswith("Microsoft Graph request failed (404"):
+                    raise
 
             parent_encoded = quote(parent, safe="/")
             url = f"{drive_base}/root:/{parent_encoded}:/children" if parent else f"{drive_base}/root/children"

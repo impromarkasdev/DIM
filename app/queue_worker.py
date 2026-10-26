@@ -168,19 +168,26 @@ async def process_dim_reference(message: Message[dict[str, Any]]) -> None:
                             ),
                             handles,
                         ))
+                    logger.info("Invoice finalizer: downloaded %s PDFs; starting merge", len(contents))
                     from api.documents.combine import _merge_pdf_contents
                     try:
                         combined = _merge_pdf_contents(contents)
                     except ValueError as exc:
                         raise PermanentProcessingError(str(exc)) from exc
+                    logger.info(
+                        "Invoice finalizer: merge complete; output size=%s bytes",
+                        len(combined),
+                    )
                     invoice = str((claimed.get("payload") or {}).get("invoice", "")).strip()
                     safe_invoice = re.sub(r"[^A-Za-z0-9_-]+", "_", invoice)[:60] or "consulta"
                     filename = f"Factura_{safe_invoice}_{job_id[:8]}.pdf"
+                    logger.info("Invoice finalizer: uploading combined PDF")
                     uploaded = combine_graph.upload_pdf(
                         f"DIM/ConsultasCombinadas/{filename}", combined
                     )
                     if not uploaded.get("id"):
                         raise RuntimeError("Microsoft Graph guardó el PDF combinado sin identificador")
+                    logger.info("Invoice finalizer: combined PDF uploaded successfully")
                     drive_id = uploaded.get("parentReference", {}).get("driveId")
                     output_drive = f"{combine_graph.base}/drives/{drive_id}" if drive_id else combine_graph.drive_base
                     result = {

@@ -14,7 +14,7 @@ import pymupdf
 import pandas as pd
 
 from .config import Settings
-from .errors import PermanentProcessingError
+from .errors import DeclarationNotFoundError, PermanentProcessingError
 from .errors import GraphAccessDeniedError
 from .graph import GraphClient
 from .pdf_splitter import FORM_NUMBER, _find_form_number
@@ -836,7 +836,9 @@ def _download_hierarchical_pdf(graph: GraphClient, entry: DimIndexRow, settings:
             max_folders=1200, max_depth=6,
         )
     if not containers:
-        raise RuntimeError("No se encontró el contenedor indicado dentro de la carpeta DIM configurada")
+        raise DeclarationNotFoundError(
+            "No se encontró el contenedor indicado dentro de la carpeta DIM configurada"
+        )
 
     consolidations: list[tuple[dict[str, Any], str]] = []
     for container_path in containers:
@@ -876,7 +878,9 @@ def _download_hierarchical_pdf(graph: GraphClient, entry: DimIndexRow, settings:
             diagnostics.append("La extracción se procesó en memoria porque no se pudo guardar la copia en Procesados")
         return LocatedPdf(extracted, file_name, processed_path, drive_base, True)
 
-    raise RuntimeError("No se encontró la declaración en Procesados, el contenedor ni DIM CON LEVANTE")
+    raise DeclarationNotFoundError(
+        "No se encontró la declaración en Procesados, el contenedor ni DIM CON LEVANTE"
+    )
 
 
 def process_dim_entry(
@@ -941,6 +945,20 @@ def process_dim_entry(
             result["factura"] = invoice
             result["referenciasFactura"] = invoice_references or [reference]
         return result
+    except DeclarationNotFoundError as exc:
+        logger.info(
+            "DIM declaration not found after scoped search: reference=%s form=%s year=%s shipment=%s",
+            reference, entry.form_number, entry.year, entry.shipment,
+        )
+        return {
+            "referencia": reference,
+            "estado": "Pendiente (No encontrado)",
+            "detalle": str(exc),
+            "numeroFormulario": entry.form_number,
+            "embarque": entry.shipment,
+            "year": entry.year,
+            "diagnostico": diagnostics,
+        }
     except PermanentProcessingError as exc:
         logger.error("DIM: redacción rechazada por una verificación permanente")
         return {

@@ -73,7 +73,7 @@ class handler(ApiHandler):
                 queue_dispatch_pending = True
                 logger.exception("Queue redispatch failed while reading DIM job %s", job_id)
             job = get_job(job_id, owner_email, is_admin=is_admin)
-            if job and job["status"] in {"completed", "partial"}:
+            if job and job["status"] in {"completed", "partial"} and job.get("jobType") != "invoice_redact":
                 _refresh_download_links(job, job_id, owner_email, is_admin)
             self.respond(200, {
                 "success": True,

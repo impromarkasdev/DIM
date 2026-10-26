@@ -14,6 +14,7 @@ ROUTES = {
     "/api/admin/users": "api.admin.users",
     "/api/admin/split-pdf": "api.admin.split_pdf",
     "/api/documents/process-redact": "api.dim.search_redact",
+    "/api/documents/process-invoice": "api.dim.process_invoice",
     "/api/dim/search-and-redact": "api.dim.search_redact",
     "/api/documents/jobs": "api.dim.jobs",
     "/api/documents/download": "api.documents.download",

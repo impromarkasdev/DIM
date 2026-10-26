@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import unittest
+import io
 from unittest.mock import patch
 import pandas as pd
 import pymupdf
@@ -19,6 +20,8 @@ from app.service import (
     _search_container,
     _safe_graph_search,
     _sheet_excel_columns,
+    _read_master_index,
+    _plain,
     _walk_scope_for_containers,
 )
 from api.admin.users import _parse_active, handler as AdminUsersHandler
@@ -29,6 +32,32 @@ from api.dim.jobs import _refresh_download_links
 
 
 class GraphSearchTests(unittest.TestCase):
+    def test_master_reference_selects_latest_acceptance_date_once(self) -> None:
+        rows = []
+        header = [None] * 46
+        header[15] = "FECHA_ACEP"
+        header[42:45] = ["REFERENCIA", "EMBARQUE", "NUMERO_FORMULARIO"]
+        header[45] = "BUSCADOR"
+        rows.append(header)
+        for accepted, form in (
+            ("2026-01-10", "032026000000001-1"),
+            ("2026-05-10", "032026000000002-2"),
+        ):
+            row = [None] * 46
+            row[15] = accepted
+            row[42:45] = ["REF-1", "Cont. 1", form]
+            row[45] = ""
+            rows.append(row)
+        workbook_bytes = io.BytesIO()
+        with pd.ExcelWriter(workbook_bytes, engine="openpyxl") as writer:
+            pd.DataFrame(rows).to_excel(writer, sheet_name="2026", header=False, index=False)
+
+        index = _read_master_index(workbook_bytes.getvalue(), type("Settings", (), {"first_year": 2021})())
+        selected = index[_plain("REF-1")]
+        self.assertEqual(selected.form_number, "032026000000002-2")
+        self.assertEqual(selected.accepted_date, "2026-05-10")
+        self.assertEqual(len([key for key in index if key == _plain("REF-1")]), 1)
+
     def test_excel_reference_columns_shift_after_2023(self) -> None:
         self.assertEqual(_excel_columns("2023"), (41, 42, 43))  # AP/AQ/AR
         self.assertEqual(_excel_columns("2024"), (42, 43, 44))  # AQ/AR/AS
@@ -325,7 +354,7 @@ class QueueConfigurationTests(unittest.TestCase):
         ]
         self.assertEqual(len(worker_subscriptions), 1)
         self.assertEqual(worker_subscriptions[0].topic, "dim-redaction")
-        self.assertEqual(worker_subscriptions[0].max_concurrency, 5)
+        self.assertEqual(worker_subscriptions[0].max_concurrency, 10)
 
     def test_queue_dispatch_failure_keeps_durable_job_id_and_returns_202(self) -> None:
         import io
@@ -352,6 +381,88 @@ class QueueConfigurationTests(unittest.TestCase):
         self.assertEqual(status, 202)
         self.assertEqual(payload["jobId"], "job-uuid")
         self.assertTrue(payload["queueDispatchPending"])
+
+    def test_invoice_endpoint_accepts_wix_request_as_durable_job(self) -> None:
+        import io
+        from unittest.mock import MagicMock
+        from api.dim.process_invoice import handler as InvoiceHandler
+
+        request = object.__new__(InvoiceHandler)
+        body = b'{"invoice":"2578","datosSensibles":[]}'
+        request.headers = {
+            "Content-Length": str(len(body)),
+            "Idempotency-Key": "invoice-test-key",
+        }
+        request.rfile = io.BytesIO(body)
+        request.claims = lambda: {"sub": "client@example.com", "role": "client"}
+        request.respond = MagicMock()
+        with patch("api.dim.process_invoice.create_job", return_value=("invoice-job", True)) as create_job, \
+             patch("api.dim.process_invoice.enqueue_job", return_value=1), \
+             patch("api.dim.process_invoice.get_job", return_value={
+                 "jobId": "invoice-job", "status": "queued", "total": 1, "completed": 0,
+             }):
+            request.do_POST()
+
+        create_job.assert_called_once()
+        self.assertEqual(create_job.call_args.kwargs["job_type"], "invoice_redact")
+        self.assertEqual(create_job.call_args.kwargs["job_metadata"], {"invoice": "2578"})
+        status, payload = request.respond.call_args.args
+        self.assertEqual(status, 202)
+        self.assertEqual(payload["jobId"], "invoice-job")
+        self.assertEqual(payload["jobType"], "invoice_redact")
+
+
+class InvoiceResolutionTests(unittest.TestCase):
+    def test_invoice_resolver_deduplicates_shared_declaration_concurrently(self) -> None:
+        from concurrent.futures import ThreadPoolExecutor
+        from types import SimpleNamespace
+        from app import invoice
+        from app.service import DimIndexRow
+
+        settings = SimpleNamespace(sales_excel_path="sales.xlsb")
+        references_by_invoice = {
+            "INV-A": ["REF-A", "REF-B"],
+            "INV-B": ["REF-C", "REF-D"],
+        }
+        shared_form = "032026000000001-1"
+        index = {
+            _plain("REF-A"): DimIndexRow("REF-A", "2026", "Cont. 1", shared_form, "2026-05-10"),
+            _plain("REF-B"): DimIndexRow("REF-B", "2026", "Cont. 1", shared_form, "2026-05-10"),
+            _plain("REF-C"): DimIndexRow("REF-C", "2025", "Cont. 2", "032025000000002-2", "2025-03-01"),
+            _plain("REF-D"): DimIndexRow("REF-D", "2025", "Cont. 2", "032025000000003-3", "2025-03-02"),
+        }
+
+        class FixtureGraph:
+            def __init__(self, _settings):
+                pass
+
+            def resolve_file(self, _path):
+                return b"fixture", "sales.xlsb", "fixture-drive", "PEDIDOS"
+
+            def download_excel(self):
+                return b"fixture-master"
+
+        def run(invoice_number):
+            return invoice.resolve_invoice_items(invoice_number, [], settings)
+
+        with patch("app.invoice.GraphClient", FixtureGraph), \
+             patch(
+                 "app.invoice._read_sales_references",
+                 side_effect=lambda _bytes, invoice_number: references_by_invoice[invoice_number],
+             ), \
+             patch("app.invoice._read_master_index", return_value=index):
+            with ThreadPoolExecutor(max_workers=2) as executor:
+                future_a = executor.submit(run, "INV-A")
+                future_b = executor.submit(run, "INV-B")
+                summary_a, items_a = future_a.result()
+                summary_b, items_b = future_b.result()
+
+        self.assertEqual(summary_a["referenciasFactura"], 2)
+        self.assertEqual(summary_a["declaracionesUnicas"], 1)
+        self.assertEqual(items_a[0]["references"], ["REF-A", "REF-B"])
+        self.assertEqual(summary_b["referenciasFactura"], 2)
+        self.assertEqual(summary_b["declaracionesUnicas"], 2)
+        self.assertEqual(len(items_b), 2)
 
     def test_schema_preflight_is_read_only(self) -> None:
         from app import users

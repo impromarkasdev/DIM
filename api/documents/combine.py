@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import logging
 import re
+from concurrent.futures import ThreadPoolExecutor
 from urllib.parse import quote
 
 import fitz
@@ -86,8 +87,8 @@ class handler(ApiHandler):
             if not job:
                 self.respond(404, {"success": False, "message": "No se encontró la solicitud."})
                 return
-            if job.get("jobType") != "redact":
-                self.respond(400, {"success": False, "message": "Solo se pueden combinar resultados de búsqueda y redacción."})
+            if job.get("jobType") not in {"redact", "invoice_redact"}:
+                self.respond(400, {"success": False, "message": "Este tipo de trabajo no tiene documentos combinables."})
                 return
             if str(job.get("status", "")).lower() not in {"completed", "partial"}:
                 self.respond(409, {
@@ -95,6 +96,30 @@ class handler(ApiHandler):
                     "message": "La consulta todavía no termina.",
                     "completed": job.get("completed", 0),
                     "total": job.get("total", 0),
+                })
+                return
+
+            if job.get("jobType") == "invoice_redact":
+                finalizer = next((
+                    (index, item)
+                    for index, item in enumerate(job.get("resultados", []))
+                    if item.get("referencia") == "PDF combinado" and item.get("estado") == "Exito"
+                ), None)
+                if not finalizer:
+                    self.respond(404, {"success": False, "message": "No hay declaraciones disponibles para descargar en esta factura."})
+                    return
+                item_index, final_result = finalizer
+                target = get_download_target(job_id, item_index, 0, owner_email, is_admin)
+                if not target:
+                    self.respond(404, {"success": False, "message": "No se encontró el PDF final de esta factura."})
+                    return
+                graph = GraphClient(Settings.from_env())
+                self.respond(200, {
+                    "success": True,
+                    "downloadUrl": graph.fresh_download_url(target["driveItemId"], target["driveBase"]),
+                    "fileName": target["name"],
+                    "combinedCount": final_result.get("numeroDeclaraciones", 0),
+                    "message": "Las declaraciones de la factura están listas en un único PDF.",
                 })
                 return
 
@@ -120,10 +145,15 @@ class handler(ApiHandler):
             graph = GraphClient(settings)
             filename = f"Declaraciones_{re.sub(r'[^A-Za-z0-9-]', '', job_id)[:12]}.pdf"
             output_path = f"{OUTPUT_FOLDER}/{filename}"
-            pdf_contents = [
-                graph.download_item({"id": handle["driveItemId"]}, drive_base=handle["driveBase"])
-                for handle in handles
-            ]
+            # Bounded parallel downloads keep invoice jobs with hundreds of
+            # declarations practical without creating an unbounded Graph burst.
+            with ThreadPoolExecutor(max_workers=min(8, len(handles))) as executor:
+                pdf_contents = list(executor.map(
+                    lambda handle: graph.download_item(
+                        {"id": handle["driveItemId"]}, drive_base=handle["driveBase"]
+                    ),
+                    handles,
+                ))
             combined = _merge_pdf_contents(pdf_contents)
             uploaded = graph.upload_pdf(output_path, combined)
             drive_id = uploaded.get("parentReference", {}).get("driveId")

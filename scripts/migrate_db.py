@@ -98,6 +98,7 @@ def migrate() -> None:
                     lease_until TIMESTAMPTZ,
                     result JSONB,
                     error TEXT,
+                    metadata JSONB NOT NULL DEFAULT '{}'::jsonb,
                     created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
                     updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
                     UNIQUE(job_id,item_index)
@@ -109,6 +110,9 @@ def migrate() -> None:
             )
             cursor.execute(
                 "ALTER TABLE dim_job_items ADD COLUMN IF NOT EXISTS queue_generation INTEGER NOT NULL DEFAULT 0"
+            )
+            cursor.execute(
+                "ALTER TABLE dim_job_items ADD COLUMN IF NOT EXISTS metadata JSONB NOT NULL DEFAULT '{}'::jsonb"
             )
             cursor.execute(
                 "CREATE INDEX IF NOT EXISTS dim_job_items_job_status "

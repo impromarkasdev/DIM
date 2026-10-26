@@ -24,6 +24,7 @@ class Settings:
     drive_id: str
     graph_user_id: str
     excel_path: str
+    sales_excel_path: str
     lookup_column_index: int
     pdf_column_index: int
     location_column_index: int
@@ -44,6 +45,12 @@ class Settings:
         }
         values = {field: os.getenv(env_name, "").strip() for field, env_name in names.items()}
         values["excel_path"] = _drive_root_relative_path(values["excel_path"])
+        values["sales_excel_path"] = os.getenv(
+            "SALES_EXCEL_PATH",
+            "https://impromarkas-my.sharepoint.com/personal/mgaviria_impromarkas_com/Documents/PEDIDOS/BD%20VENTAS%2020-26%20MAR%20CON%20MG.xlsb",
+        ).strip()
+        if not values["sales_excel_path"].startswith("https://"):
+            values["sales_excel_path"] = _drive_root_relative_path(values["sales_excel_path"])
         values["auth_mode"] = os.getenv("AZURE_AUTH_MODE", "client_credentials").strip()
         if values["auth_mode"] not in {"client_credentials", "refresh_token"}:
             raise RuntimeError("AZURE_AUTH_MODE must be client_credentials or refresh_token")

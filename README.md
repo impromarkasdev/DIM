@@ -96,7 +96,7 @@ Operación de fallos: `GET /api/admin/jobs` lista trabajos con elementos fallido
 
 OCR en Vercel: define `AZURE_DOCUMENT_INTELLIGENCE_ENDPOINT` y `AZURE_DOCUMENT_INTELLIGENCE_KEY`. Sólo si el texto seleccionable no permite reconocer Campo 4, el worker construye un PDF temporal con los recortes de esa casilla y los envía al modelo `prebuilt-read` de Azure Document Intelligence en una sola operación; las páginas completas no se envían. Revisa privacidad, región y precio del recurso Azure. `pytesseract` es sólo una alternativa local y requiere que el ejecutable Tesseract esté instalado en ese equipo.
 
-Duración del worker: `vercel.json` configura hasta 300 segundos para `app/queue_worker.py`; la API de recepción permanece en 60 segundos. El suscriptor procesa hasta cinco referencias concurrentes; Graph 429/5xx se reintenta con backoff, por lo que una limitación de Microsoft no se informa falsamente como “no encontrado”. Tras desplegar, confirma en el resumen del build que el suscriptor `app.queue_worker` quedó registrado y verifica en el detalle de funciones el límite efectivo del worker. Los máximos disponibles dependen de plan y configuración de Fluid Compute.
+Duración del worker: `vercel.json` configura hasta 300 segundos para `app/queue_worker.py`; la API de recepción permanece en 60 segundos. El suscriptor procesa hasta diez referencias concurrentes; Graph 429/5xx se reintenta con backoff, por lo que una limitación de Microsoft no se informa falsamente como “no encontrado”. Tras desplegar, confirma en el resumen del build que el suscriptor `app.queue_worker` quedó registrado y verifica en el detalle de funciones el límite efectivo del worker. Los máximos disponibles dependen de plan y configuración de Fluid Compute.
 
 Ejemplo de polling para una página Velo (el estado y los archivos se actualizan sin mover los controles):
 
@@ -179,3 +179,28 @@ After deploying and setting the Vercel variables, request `GET /api/process` wit
 For a successful reference, the job result contains its form number, status, diagnostics, and an authenticated download link. The link is regenerated from the stored DriveItem ID when the authenticated status endpoint is called; temporary Graph URLs are never stored in Neon. Search uses the whole configured drive's Graph search endpoint, exhausts all result pages, validates exact form names, and then searches the relevant container hierarchy. A Graph error is surfaced as a retryable job error, not reported as “not found.” Graph's drive search is an indexed search, so very recently uploaded/renamed items may take time to appear; verify a failed item through admin job diagnostics and retry once indexing catches up.
 
 Legacy `POST /api/process` remains synchronous for existing webhook callers. The Wix search/redaction UI should use the queued endpoints above.
+
+## Consulta y redacción por factura
+
+`POST /api/documents/process-invoice` inicia un trabajo durable independiente del endpoint de referencias existente. Recibe `{ "invoice": "número de factura", "datosSensibles": [] }`, requiere Bearer JWT y admite hasta 1.000 referencias distintas. El XLSB de ventas se lee desde `SALES_EXCEL_PATH` (por defecto la URL SharePoint de `BD VENTAS 20-26 MAR CON MG.xlsb`); factura está en columna C y referencia en K. El worker escanea ese archivo una sola vez por trabajo y persiste las declaraciones resueltas en Neon antes de publicarlas individualmente a la cola.
+
+El cruce DIM revisa todas las hojas disponibles desde 2026 hasta 2020. Cada referencia devuelve una sola fila DIM: prioriza la `FECHA_ACEP` más reciente entre todos los años; si la fecha falta o empata, usa la hoja/año más reciente y luego el registro que aparece más abajo en la hoja. Este criterio también se aplica al flujo individual `/api/documents/process-redact`. Si varias referencias apuntan al mismo Número de Formulario, se procesa una sola vez y se conservan todas las referencias asociadas. Si el formulario tiene varias páginas, se mantiene como un único PDF multipágina.
+
+Solicitud de inicio:
+
+```http
+POST /api/documents/process-invoice
+Authorization: Bearer <JWT>
+Content-Type: application/json
+Idempotency-Key: <clave-opcional>
+```
+
+```json
+{ "invoice": "93614", "datosSensibles": [] }
+```
+
+Medición hecha sobre la copia local del XLSB entregado: 267.230 filas de ventas y máximo de 252 referencias distintas en una factura; hay 12 facturas con más de 200 referencias y una con más de 250. Con la regla de una declaración por referencia, una factura de esa muestra producirá como máximo 252 declaraciones antes de deduplicar formularios compartidos. El tope técnico se deja en 1.000 para crecimiento; el límite síncrono de 30 referencias del endpoint existente no se modifica.
+
+Responde `202 Accepted` con `jobId`, `jobType: "invoice_redact"` y `statusUrl`. Wix consulta el mismo `/api/documents/jobs`; el total se actualiza al expandir la factura. Los resultados contienen factura, referencia o referencias asociadas, número de formulario, embarque, año, estado y diagnóstico seguro. Cuando todos los ítems terminan, un ítem finalizador de la misma cola combina los PDF exitosos sin duplicar el número DIM; así la solicitud Wix no hace cientos de descargas sincrónicas. `POST /api/documents/combine` devuelve el enlace temporal del PDF final ya preparado y conserva el límite defensivo de 100 MiB de entrada total.
+
+Antes de desplegar, ejecutar `python scripts/migrate_db.py` para crear la columna `metadata JSONB` en `dim_job_items`; correr la migración antes del código nuevo, nunca desde una función Vercel. `pyxlsb>=1.0.10` ya está añadido en `pyproject.toml` y ambos `requirements.txt`. `SALES_EXCEL_PATH` se puede configurar en Vercel para cambiar la fuente sin editar el código. La aplicación Graph debe tener acceso a la ubicación XLSB y al libro DIM.

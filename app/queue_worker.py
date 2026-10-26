@@ -3,6 +3,9 @@ from __future__ import annotations
 import logging
 import os
 import time
+import asyncio
+import re
+from concurrent.futures import ThreadPoolExecutor
 from typing import Any
 from urllib.parse import urlparse
 
@@ -12,9 +15,13 @@ from vercel.queue import Message, RetryAfter, subscribe
 from .config import Settings
 from .errors import PermanentProcessingError
 from .graph import GraphClient
-from .jobs import _safe_error_message, claim_item, complete_item, retry_or_fail_item
+from .jobs import (
+    _safe_error_message, claim_item, complete_item, enqueue_job,
+    expand_invoice_job, list_job_download_targets, retry_or_fail_item,
+)
 from .pdf_splitter import split_declarations_with_report
-from .service import process_hierarchical_references
+from .service import process_dim_entry, process_hierarchical_references
+from .invoice import entry_from_metadata, resolve_invoice_items
 
 logger = logging.getLogger(__name__)
 MAX_DELIVERIES = 10
@@ -52,7 +59,7 @@ def _alert_terminal_failure(job_id: str, item_index: int, error: str, attempt_co
         logger.error("Admin failure alert could not be delivered (%s)", type(exc).__name__)
 
 
-@subscribe(topic="dim-redaction", retry_after=60, max_concurrency=5)
+@subscribe(topic="dim-redaction", retry_after=60, max_concurrency=10)
 async def process_dim_reference(message: Message[dict[str, Any]]) -> None:
     """Queue consumer: process a single reference so each item can retry alone."""
     payload = message.payload
@@ -109,6 +116,116 @@ async def process_dim_reference(message: Message[dict[str, Any]]) -> None:
                 "downloadFiles": download_files,
                 "skippedPages": skipped_pages,
             }
+        elif claimed["job_type"] == "invoice_redact" and item_index == 0:
+            invoice = str((claimed.get("payload") or {}).get("invoice", reference)).strip()
+            summary, declaration_items = resolve_invoice_items(
+                invoice, claimed.get("sensitive_terms", []), settings
+            )
+            parent_result = {
+                **summary,
+                "estado": "Exito",
+                "factura": invoice,
+                "referencia": f"Factura {invoice}",
+            }
+            expanded = expand_invoice_job(job_id, parent_result, declaration_items)
+            logger.info(
+                "Invoice job expanded: job=%s invoice=%s declarations_and_unmatched=%s",
+                job_id, invoice, expanded,
+            )
+            # Queue publication is outside the expansion transaction. If the
+            # publisher is briefly unavailable, status polling will redispatch
+            # from the durable item table; don't reopen the completed parent.
+            try:
+                await asyncio.to_thread(enqueue_job, job_id)
+            except Exception:
+                logger.exception("Could not publish expanded invoice items; status polling will retry: job=%s", job_id)
+            logger.info(
+                "Invoice resolution completed: job=%s invoice=%s refs=%s declarations=%s unmatched=%s",
+                job_id, invoice, summary["referenciasFactura"],
+                summary["declaracionesUnicas"], summary["referenciasSinDIM"],
+            )
+            return
+        elif claimed["job_type"] == "invoice_redact":
+            metadata = claimed.get("metadata") or {}
+            invoice = str(metadata.get("invoice", ""))
+            references_for_dim = metadata.get("references", [])
+            if metadata.get("kind") == "finalize":
+                handles = list_job_download_targets(job_id)
+                if not handles:
+                    result = {
+                        "estado": "Pendiente (No encontrado)",
+                        "factura": str((claimed.get("payload") or {}).get("invoice", "")),
+                        "referencia": "PDF combinado",
+                        "detalle": "La factura no produjo declaraciones disponibles para combinar.",
+                    }
+                else:
+                    logger.info("Invoice finalizer: downloading %s unique redacted PDFs", len(handles))
+                    combine_graph = GraphClient(settings)
+                    with ThreadPoolExecutor(max_workers=min(8, len(handles))) as executor:
+                        contents = list(executor.map(
+                            lambda target: combine_graph.download_item(
+                                {"id": target["driveItemId"]}, drive_base=target["driveBase"]
+                            ),
+                            handles,
+                        ))
+                    from api.documents.combine import _merge_pdf_contents
+                    try:
+                        combined = _merge_pdf_contents(contents)
+                    except ValueError as exc:
+                        raise PermanentProcessingError(str(exc)) from exc
+                    invoice = str((claimed.get("payload") or {}).get("invoice", "")).strip()
+                    safe_invoice = re.sub(r"[^A-Za-z0-9_-]+", "_", invoice)[:60] or "consulta"
+                    filename = f"Factura_{safe_invoice}_{job_id[:8]}.pdf"
+                    uploaded = combine_graph.upload_pdf(
+                        f"DIM/ConsultasCombinadas/{filename}", combined
+                    )
+                    if not uploaded.get("id"):
+                        raise RuntimeError("Microsoft Graph guardó el PDF combinado sin identificador")
+                    drive_id = uploaded.get("parentReference", {}).get("driveId")
+                    output_drive = f"{combine_graph.base}/drives/{drive_id}" if drive_id else combine_graph.drive_base
+                    result = {
+                        "estado": "Exito",
+                        "factura": invoice,
+                        "referencia": "PDF combinado",
+                        "nombre_pdf": filename,
+                        "numeroDeclaraciones": len(handles),
+                        "downloadFiles": [{
+                            "driveItemId": str(uploaded["id"]),
+                            "driveBase": output_drive,
+                            "name": filename,
+                        }],
+                    }
+            elif metadata.get("kind") != "declaration":
+                finalizer_created = complete_item(job_id, item_index, {
+                    "estado": "Pendiente (No encontrado)",
+                    "factura": invoice,
+                    "referencia": reference,
+                    "referenciasFactura": references_for_dim,
+                    "detalle": "La referencia de esta factura no aparece en las hojas del archivo maestro DIM.",
+                })
+                if finalizer_created:
+                    try:
+                        await asyncio.to_thread(enqueue_job, job_id)
+                    except Exception:
+                        logger.exception("Could not publish invoice finalizer; status polling will retry: job=%s", job_id)
+                logger.info("Invoice reference has no DIM match: job=%s item=%s", job_id, item_index)
+                return
+            entry = entry_from_metadata(metadata)
+            result = process_dim_entry(
+                reference,
+                entry,
+                claimed.get("sensitive_terms", []),
+                settings,
+                invoice=invoice,
+                invoice_references=references_for_dim,
+            )
+            result["factura"] = invoice
+            result["referenciasFactura"] = references_for_dim
+            if result.get("estado") == "Error":
+                detail = str(result.get("detalle", "No fue posible procesar el documento"))
+                if result.get("_permanentError"):
+                    raise PermanentProcessingError(detail)
+                raise RuntimeError(detail)
         else:
             result = process_hierarchical_references(
                 [reference], claimed.get("sensitive_terms", []), settings
@@ -118,7 +235,12 @@ async def process_dim_reference(message: Message[dict[str, Any]]) -> None:
                 if result.get("_permanentError"):
                     raise PermanentProcessingError(detail)
                 raise RuntimeError(detail)
-        complete_item(job_id, item_index, result)
+        finalizer_created = complete_item(job_id, item_index, result)
+        if finalizer_created:
+            try:
+                await asyncio.to_thread(enqueue_job, job_id)
+            except Exception:
+                logger.exception("Could not publish invoice finalizer; status polling will retry: job=%s", job_id)
         logger.info(
             "DIM queue item completed: job=%s index=%s state=%s duration_seconds=%.2f",
             job_id, item_index, result.get("estado"), time.monotonic() - started_at,
@@ -127,7 +249,12 @@ async def process_dim_reference(message: Message[dict[str, Any]]) -> None:
         raise
     except Exception as exc:
         terminal = isinstance(exc, PermanentProcessingError) or delivery_count >= MAX_DELIVERIES
-        retry_or_fail_item(job_id, item_index, str(exc), terminal=terminal)
+        finalizer_created = retry_or_fail_item(job_id, item_index, str(exc), terminal=terminal)
+        if finalizer_created:
+            try:
+                await asyncio.to_thread(enqueue_job, job_id)
+            except Exception:
+                logger.exception("Could not publish invoice finalizer after item failure: job=%s", job_id)
         if terminal:
             _alert_terminal_failure(
                 job_id, item_index, _safe_error_message(str(exc)), delivery_count

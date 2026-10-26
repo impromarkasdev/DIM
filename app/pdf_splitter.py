@@ -95,6 +95,7 @@ def split_declarations_with_report(pdf_bytes: bytes) -> tuple[list[tuple[str, by
             for page_number, (page, text) in enumerate(zip(source, page_texts)):
                 if blank_pages[page_number]:
                     logger.info("PDF split: blank page %s skipped", page_number + 1)
+                    skipped_pages.append(page_number + 1)
                     continue
                 # Only a Campo 4 number starts a new declaration. All following
                 # nonblank pages remain with that declaration until the next

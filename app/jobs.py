@@ -44,7 +44,7 @@ def create_job(
 ) -> tuple[str, bool]:
     """Persist a job and its per-reference work items before queue publishing."""
     ensure_jobs_schema()
-    if job_type not in {"redact", "split_pdf"}:
+    if job_type not in {"redact", "split_pdf", "invoice_redact"}:
         raise ValueError("Unsupported document job type")
     job_id = uuid4()
     with _connection_pool().connection() as connection, connection.cursor() as cursor:
@@ -79,14 +79,15 @@ def create_job(
     return str(job_id), True
 
 
-def _refresh_job(cursor: Any, job_id: UUID) -> None:
+def _refresh_job(cursor: Any, job_id: UUID) -> bool:
     # Serialize aggregate refreshes for a job. Without this row lock, two
     # workers completing at nearly the same time can both count the same old
     # snapshot and overwrite `completed` with a stale value (e.g. 9/10 forever).
     # All state-changing paths lock item rows before this job row.
-    cursor.execute("SELECT id FROM dim_jobs WHERE id=%s FOR UPDATE", (job_id,))
-    if not cursor.fetchone():
-        return
+    cursor.execute("SELECT id,job_type,total FROM dim_jobs WHERE id=%s FOR UPDATE", (job_id,))
+    job = cursor.fetchone()
+    if not job:
+        return False
     cursor.execute(
         """
         SELECT COUNT(*) FILTER (WHERE status IN ('completed','not_found','failed','enqueue_failed')) AS terminal,
@@ -98,6 +99,36 @@ def _refresh_job(cursor: Any, job_id: UUID) -> None:
         (job_id, job_id),
     )
     counts = cursor.fetchone()
+    if job["job_type"] == "invoice_redact":
+        cursor.execute(
+            """SELECT COUNT(*) AS child_total,
+                      COUNT(*) FILTER (WHERE status IN ('completed','not_found','failed','enqueue_failed')) AS child_terminal
+               FROM dim_job_items
+               WHERE job_id=%s AND item_index>0 AND metadata->>'kind' IS DISTINCT FROM 'finalize'""",
+            (job_id,),
+        )
+        children = cursor.fetchone()
+        cursor.execute(
+            "SELECT EXISTS(SELECT 1 FROM dim_job_items WHERE job_id=%s AND metadata->>'kind'='finalize') AS exists",
+            (job_id,),
+        )
+        has_finalizer = bool(cursor.fetchone()["exists"])
+        if (
+            int(children["child_total"]) > 0
+            and int(children["child_total"]) == int(children["child_terminal"])
+            and not has_finalizer
+        ):
+            finalizer_index = int(job["total"])
+            cursor.execute(
+                "INSERT INTO dim_job_items(id,job_id,item_index,reference,metadata) VALUES(%s,%s,%s,%s,%s)",
+                (uuid4(), job_id, finalizer_index, "__invoice_finalize__", Jsonb({"kind": "finalize"})),
+            )
+            cursor.execute(
+                "UPDATE dim_jobs SET total=total+1,completed=%s,failed=%s,status='queued',last_error=%s,updated_at=NOW() WHERE id=%s",
+                (counts["terminal"], counts["failed"], counts["last_error"], job_id),
+            )
+            logger.info("Invoice finalizer queued after all declaration items became terminal: job=%s", job_id)
+            return True
     cursor.execute(
         """
         UPDATE dim_jobs AS job
@@ -119,6 +150,7 @@ def _refresh_job(cursor: Any, job_id: UUID) -> None:
             counts["terminal"], counts["failed"], counts["last_error"], job_id,
         ),
     )
+    return False
 
 
 def _recover_expired_items(cursor: Any, job_id: UUID) -> int:
@@ -262,7 +294,7 @@ def claim_item(job_id: str, item_index: int) -> dict[str, Any] | None:
             FROM dim_jobs AS job
             WHERE item.job_id=job.id AND job.id=%s AND item.item_index=%s
               AND (item.status='queued' OR (item.status='processing' AND item.lease_until<NOW()))
-            RETURNING item.reference,item.attempts,job.payload,job.job_type
+            RETURNING item.reference,item.attempts,item.metadata,job.payload,job.job_type
             """,
             (parsed_id, item_index),
         )
@@ -275,6 +307,8 @@ def claim_item(job_id: str, item_index: int) -> dict[str, Any] | None:
                 "job_type": str(claimed["job_type"]),
                 "sensitive_terms": (claimed["payload"] or {}).get("sensitive_terms", []),
                 "file_path": (claimed["payload"] or {}).get("file_path"),
+                "metadata": claimed["metadata"] or {},
+                "payload": claimed["payload"] or {},
             }
         cursor.execute(
             "SELECT status,lease_until FROM dim_job_items WHERE job_id=%s AND item_index=%s",
@@ -290,7 +324,7 @@ def claim_item(job_id: str, item_index: int) -> dict[str, Any] | None:
 
 
 @_retry_database_operation
-def complete_item(job_id: str, item_index: int, result: dict[str, Any]) -> None:
+def complete_item(job_id: str, item_index: int, result: dict[str, Any]) -> bool:
     parsed_id = UUID(job_id)
     state = "completed" if result.get("estado") == "Exito" else "not_found"
     # Graph downloadUrl values are short-lived bearer links. Never persist them;
@@ -301,11 +335,61 @@ def complete_item(job_id: str, item_index: int, result: dict[str, Any]) -> None:
             "UPDATE dim_job_items SET status=%s,result=%s,error=NULL,lease_until=NULL,updated_at=NOW() WHERE job_id=%s AND item_index=%s",
             (state, Jsonb(durable_result), parsed_id, item_index),
         )
-        _refresh_job(cursor, parsed_id)
+        finalize_created = _refresh_job(cursor, parsed_id)
+    return finalize_created
 
 
 @_retry_database_operation
-def retry_or_fail_item(job_id: str, item_index: int, error: str, terminal: bool) -> None:
+def expand_invoice_job(job_id: str, summary: dict[str, Any], items: list[dict[str, Any]]) -> int:
+    """Atomically replace the invoice's placeholder work item with declaration items.
+
+    Network/Excel processing happens before this short transaction. Item metadata
+    is persisted separately so queue workers do not have to re-download either
+    workbook for every declaration.
+    """
+    ensure_jobs_schema()
+    parsed_id = UUID(job_id)
+    with _connection_pool().connection() as connection, connection.cursor() as cursor:
+        cursor.execute(
+            "SELECT status FROM dim_job_items WHERE job_id=%s AND item_index=0 FOR UPDATE",
+            (parsed_id,),
+        )
+        placeholder = cursor.fetchone()
+        # At-least-once delivery: only the worker that owns the processing
+        # placeholder may expand it. An already-expanded job is an idempotent no-op.
+        if not placeholder or placeholder["status"] != "processing":
+            return 0
+        # Keep the global lock order item -> job used by claim/complete paths;
+        # reversing it would create a deadlock during duplicate queue delivery.
+        cursor.execute(
+            "SELECT job_type,total FROM dim_jobs WHERE id=%s FOR UPDATE", (parsed_id,)
+        )
+        job = cursor.fetchone()
+        if not job or job["job_type"] != "invoice_redact":
+            raise ValueError("El trabajo no es una consulta por factura")
+        cursor.execute(
+            "UPDATE dim_job_items SET status='completed',result=%s,error=NULL,lease_until=NULL,updated_at=NOW() "
+            "WHERE job_id=%s AND item_index=0",
+            (Jsonb(summary), parsed_id),
+        )
+        if items:
+            cursor.executemany(
+                "INSERT INTO dim_job_items(id,job_id,item_index,reference,metadata) VALUES(%s,%s,%s,%s,%s)",
+                [
+                    (uuid4(), parsed_id, index, str(item.get("reference", "")), Jsonb(item))
+                    for index, item in enumerate(items, start=1)
+                ],
+            )
+        cursor.execute(
+            "UPDATE dim_jobs SET total=%s,status='processing',updated_at=NOW() WHERE id=%s",
+            (len(items) + 1, parsed_id),
+        )
+        _refresh_job(cursor, parsed_id)
+    return len(items)
+
+
+@_retry_database_operation
+def retry_or_fail_item(job_id: str, item_index: int, error: str, terminal: bool) -> bool:
     parsed_id = UUID(job_id)
     safe_error = _safe_error_message(error)
     status = "failed" if terminal else "queued"
@@ -315,7 +399,8 @@ def retry_or_fail_item(job_id: str, item_index: int, error: str, terminal: bool)
             "UPDATE dim_job_items SET status=%s,error=%s,result=COALESCE(%s,result),lease_until=NULL,updated_at=NOW() WHERE job_id=%s AND item_index=%s",
             (status, safe_error, result, parsed_id, item_index),
         )
-        _refresh_job(cursor, parsed_id)
+        finalize_created = _refresh_job(cursor, parsed_id)
+    return finalize_created
 
 
 @_retry_database_operation
@@ -335,6 +420,15 @@ def retry_failed_items(job_id: str) -> int:
         )
         count = cursor.rowcount
         if count:
+            cursor.execute("SELECT job_type FROM dim_jobs WHERE id=%s FOR UPDATE", (parsed_id,))
+            job = cursor.fetchone()
+            if job and job["job_type"] == "invoice_redact":
+                cursor.execute(
+                    "DELETE FROM dim_job_items WHERE job_id=%s AND metadata->>'kind'='finalize' AND status<>'processing'",
+                    (parsed_id,),
+                )
+                if cursor.rowcount:
+                    cursor.execute("UPDATE dim_jobs SET total=GREATEST(1,total-1) WHERE id=%s", (parsed_id,))
             cursor.execute("UPDATE dim_jobs SET status='queued',last_error=NULL,updated_at=NOW() WHERE id=%s", (parsed_id,))
             _refresh_job(cursor, parsed_id)
         return count
@@ -370,6 +464,47 @@ def get_download_target(
     if not drive_item_id or not drive_base or not filename.lower().endswith(".pdf"):
         return None
     return {"driveItemId": drive_item_id, "driveBase": drive_base, "name": filename}
+
+
+@_retry_database_operation
+def list_job_download_targets(job_id: str) -> list[dict[str, str]]:
+    """Internal worker-only list of unique completed declaration DriveItems."""
+    ensure_jobs_schema()
+    parsed_id = UUID(job_id)
+    with _connection_pool().connection() as connection, connection.cursor() as cursor:
+        cursor.execute(
+            "SELECT item_index,result FROM dim_job_items WHERE job_id=%s AND item_index>0 "
+            "AND status='completed' AND result IS NOT NULL ORDER BY item_index",
+            (parsed_id,),
+        )
+        rows = list(cursor.fetchall())
+    result: list[dict[str, str]] = []
+    seen_forms: set[str] = set()
+    seen_ids: set[str] = set()
+    for row in rows:
+        item_result = row["result"] or {}
+        if item_result.get("estado") != "Exito":
+            continue
+        digits = "".join(re.findall(r"\d", str(item_result.get("numeroFormulario", ""))))
+        form_key = digits[:15] if len(digits) in {15, 16} else ""
+        if form_key and form_key in seen_forms:
+            continue
+        handles = item_result.get("downloadFiles", [])
+        if not isinstance(handles, list) or not handles:
+            continue
+        handle = handles[0]
+        if not isinstance(handle, dict):
+            continue
+        item_id = str(handle.get("driveItemId", "")).strip()
+        drive_base = str(handle.get("driveBase", "")).strip()
+        name = str(handle.get("name", "documento.pdf")).strip()
+        if not item_id or not drive_base or item_id in seen_ids:
+            continue
+        seen_ids.add(item_id)
+        if form_key:
+            seen_forms.add(form_key)
+        result.append({"driveItemId": item_id, "driveBase": drive_base, "name": name})
+    return result
 
 
 @_retry_database_operation
@@ -415,7 +550,7 @@ def get_job(job_id: str, owner_email: str, is_admin: bool = False) -> dict[str, 
         if not job:
             return None
         cursor.execute(
-            "SELECT item_index,reference,status,attempts,result,error,updated_at "
+            "SELECT item_index,reference,status,attempts,result,error,metadata,updated_at "
             "FROM dim_job_items WHERE job_id=%s ORDER BY item_index",
             (parsed_id,),
         )
@@ -432,15 +567,39 @@ def get_job(job_id: str, owner_email: str, is_admin: bool = False) -> dict[str, 
         "lastError": _safe_error_message(job["last_error"]) if job["last_error"] else None,
         "resultados": [
             {
-                "referencia": "PDF maestro" if job["job_type"] == "split_pdf" else item["reference"],
+                "referencia": (
+                    "PDF maestro" if job["job_type"] == "split_pdf"
+                    else item["result"].get("referencia", item["reference"]) if item["result"]
+                    else item["reference"]
+                ),
                 "estado": item["result"].get("estado") if item["result"] else item["status"],
                 "attempts": int(item["attempts"]),
                 "updatedAt": item["updated_at"].isoformat(),
                 "nombre_pdf": item["result"].get("nombre_pdf") if item["result"] else None,
-                "numeroFormulario": item["result"].get("numeroFormulario") if item["result"] else None,
+                "numeroFormulario": (
+                    (item["result"].get("numeroFormulario") if item["result"] else None)
+                    or (item["metadata"] or {}).get("form_number")
+                ),
+                "factura": (
+                    (item["result"].get("factura") if item["result"] else None)
+                    or (item["metadata"] or {}).get("invoice")
+                ),
+                "referenciasFactura": (
+                    (item["result"].get("referenciasFactura") if item["result"] else None)
+                    or (item["metadata"] or {}).get("references")
+                ),
+                "year": (
+                    (item["result"].get("year") if item["result"] else None)
+                    or (item["metadata"] or {}).get("year")
+                ),
+                "embarque": (
+                    (item["result"].get("embarque") if item["result"] else None)
+                    or (item["metadata"] or {}).get("shipment")
+                ),
+                "numeroDeclaraciones": item["result"].get("numeroDeclaraciones") if item["result"] else None,
                 "downloadUrl": (
                     f"/api/documents/download?jobId={job['id']}&itemIndex={item['item_index']}&fileIndex=0"
-                    if item["result"] and item["result"].get("downloadFiles") else None
+                    if job["job_type"] != "invoice_redact" and item["result"] and item["result"].get("downloadFiles") else None
                 ),
                 "count": item["result"].get("count") if item["result"] else None,
                 "outputFolder": item["result"].get("outputFolder") if item["result"] else None,

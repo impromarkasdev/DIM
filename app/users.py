@@ -119,6 +119,15 @@ def ensure_jobs_schema() -> None:
                 raise RuntimeError(
                     "Document-job schema is not initialized; run scripts/migrate_db.py before serving traffic"
                 )
+            cursor.execute(
+                "SELECT EXISTS (SELECT 1 FROM information_schema.columns "
+                "WHERE table_schema='public' AND table_name='dim_job_items' AND column_name='metadata') AS has_metadata"
+            )
+            columns = cursor.fetchone()
+            if not columns or not columns["has_metadata"]:
+                raise RuntimeError(
+                    "Document-job schema upgrade is required; run scripts/migrate_db.py before deployment"
+                )
         _jobs_schema_ready = True
 
 

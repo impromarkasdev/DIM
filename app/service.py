@@ -85,6 +85,7 @@ class DimIndexRow:
     year: str
     shipment: str
     form_number: str
+    accepted_date: str = ""
 
 
 @dataclass(frozen=True)
@@ -232,7 +233,24 @@ def _form_pdf_name(form_number: str, source_name: str = "", pdf_bytes: bytes = b
 
 
 def _years(settings: Settings) -> list[str]:
-    return [str(year) for year in range(datetime.now().year, settings.first_year - 1, -1)]
+    # DIM sheets are maintained back to 2020. Never let an older Vercel
+    # EXCEL_FIRST_YEAR setting silently hide historical declarations.
+    earliest_year = min(settings.first_year, 2020)
+    return [str(year) for year in range(datetime.now().year, earliest_year - 1, -1)]
+
+
+def _date_rank(value: Any) -> tuple[int, int, int, int, int]:
+    """Convert Excel's acceptance date to a stable sortable key; blank dates sort last by row order."""
+    try:
+        if isinstance(value, (int, float)) and not isinstance(value, bool):
+            parsed = pd.Timestamp("1899-12-30") + pd.to_timedelta(float(value), unit="D")
+        else:
+            parsed = pd.to_datetime(value, errors="coerce")
+        if pd.isna(parsed):
+            return (0, 0, 0, 0, 0)
+        return (int(parsed.year), int(parsed.month), int(parsed.day), int(parsed.hour), int(parsed.minute))
+    except (TypeError, ValueError, OverflowError):
+        return (0, 0, 0, 0, 0)
 
 
 def _read_master_index(workbook: bytes, settings: Settings) -> dict[str, DimIndexRow]:
@@ -240,10 +258,11 @@ def _read_master_index(workbook: bytes, settings: Settings) -> dict[str, DimInde
         wanted_years = set(_years(settings))
         excel = pd.ExcelFile(io.BytesIO(workbook), engine="openpyxl")
         sheets = {
-            # The lookup triplet is around AP:AS. Reading a narrow column
-            # window avoids materializing all product descriptions.
+            # Reference/form data is near AP:AS. Include the declaration
+            # acceptance date (FECHA_ACEP) so repeated references in a year
+            # resolve to the newest declaration, not the first product row.
             name: excel.parse(
-                sheet_name=name, header=None, dtype=object, usecols=range(38, 46)
+                sheet_name=name, header=None, dtype=object, usecols=range(0, 46)
             )
             for name in excel.sheet_names
             if str(name) in wanted_years
@@ -251,18 +270,26 @@ def _read_master_index(workbook: bytes, settings: Settings) -> dict[str, DimInde
     except Exception as exc:
         raise RuntimeError("No fue posible leer el Excel maestro") from exc
     indexed: dict[str, DimIndexRow] = {}
+    rank_by_reference: dict[str, tuple[tuple[int, int, int, int, int], int, int]] = {}
     for year in _years(settings):
         frame = sheets.get(year)
         if frame is None:
             logger.info("DIM Excel: hoja %s no existe", year)
             continue
-        column_offset = 38
+        column_offset = 0
         header_row, reference_column, shipment_column, form_column = _sheet_excel_columns(
             frame, year, column_offset
         )
-        local_columns = tuple(column - column_offset for column in (
-            reference_column, shipment_column, form_column
-        ))
+        date_column = next(
+            (
+                column
+                for row_index in range(min(len(frame.index), 20))
+                for column, value in enumerate(frame.iloc[row_index].tolist())
+                if _plain(_cell_text(value)) in {"fechaacep", "fechaaceptacion"}
+            ),
+            -1,
+        )
+        local_columns = (reference_column, shipment_column, form_column)
         if min(local_columns) < 0 or frame.shape[1] <= max(local_columns):
             logger.warning("DIM Excel: hoja %s no contiene las columnas esperadas", year)
             continue
@@ -274,14 +301,23 @@ def _read_master_index(workbook: bytes, settings: Settings) -> dict[str, DimInde
         for column in local_columns:
             frame.iloc[:, column] = frame.iloc[:, column].astype(str).str.strip()
         sheet_matches = 0
-        for _, row in frame.iloc[header_row + 1 :].iterrows():
+        for row_number, (_, row) in enumerate(frame.iloc[header_row + 1 :].iterrows(), start=header_row + 2):
             reference, shipment, form_number = (
                 _cell_text(row.iloc[column])
                 for column in local_columns
             )
             key = _plain(reference)
-            if key and shipment and form_number and key not in indexed:
-                indexed[key] = DimIndexRow(reference, year, shipment, form_number)
+            if not (key and shipment and form_number):
+                continue
+            accepted_date_value = row.iloc[date_column] if 0 <= date_column < len(row) else ""
+            accepted_date = _cell_text(accepted_date_value)
+            rank = (_date_rank(accepted_date_value), int(year), row_number)
+            # One reference maps to exactly one declaration: latest FECHA_ACEP
+            # across the workbook; if dates are unavailable/equal, newest sheet
+            # year and then the last physical row are deterministic tie-breakers.
+            if key not in rank_by_reference or rank > rank_by_reference[key]:
+                indexed[key] = DimIndexRow(reference, year, shipment, form_number, accepted_date)
+                rank_by_reference[key] = rank
                 sheet_matches += 1
         logger.info("DIM Excel: indexadas %s referencias desde hoja %s", sheet_matches, year)
     logger.info("DIM Excel: índice cargado con %s referencias", len(indexed))
@@ -843,6 +879,79 @@ def _download_hierarchical_pdf(graph: GraphClient, entry: DimIndexRow, settings:
     raise RuntimeError("No se encontró la declaración en Procesados, el contenedor ni DIM CON LEVANTE")
 
 
+def process_dim_entry(
+    reference: str,
+    entry: DimIndexRow,
+    supplied_terms: list[str],
+    settings: Settings,
+    graph: GraphClient | None = None,
+    invoice: str | None = None,
+    invoice_references: list[str] | None = None,
+) -> dict[str, Any]:
+    """Redact one already-resolved DIM row; used by reference and invoice jobs."""
+    graph = graph or GraphClient(settings)
+    diagnostics = [f"Referencia encontrada en hoja {entry.year}"]
+    terms = [value.strip() for value in supplied_terms if value.strip()]
+    try:
+        located: LocatedPdf | None = None
+        for lookup_attempt in range(2):
+            try:
+                located = _download_hierarchical_pdf(graph, entry, settings, diagnostics)
+                break
+            except RuntimeError:
+                if lookup_attempt > 0 or not graph.had_transient_failure:
+                    raise
+                graph.had_transient_failure = False
+                diagnostics.append("Se reintentó la búsqueda por una respuesta temporal de SharePoint")
+                logger.warning("DIM: repitiendo búsqueda tras un fallo temporal de Graph")
+        if located is None:
+            raise RuntimeError("No fue posible resolver el archivo de la declaración")
+        sanitized = redact_pdf(located.content, terms)
+        file_name = _form_pdf_name(entry.form_number, located.file_name, located.content)
+        source_folder = located.parent_folder
+        if source_folder.endswith("/Procesados"):
+            source_folder = source_folder.rsplit("/", 1)[0]
+        output_folder = f"{source_folder}/Enviados"
+        metadata = graph.upload_pdf(f"{output_folder}/{file_name}", sanitized, located.drive_base)
+        diagnostics.append("Redacción física aplicada y archivo subido")
+        if not metadata.get("id"):
+            raise RuntimeError("Microsoft Graph guardó el PDF sin devolver su identificador")
+        drive_reference = metadata.get("parentReference", {}).get("driveId")
+        stable_drive_base = (
+            f"{graph.base}/drives/{drive_reference}" if drive_reference else located.drive_base
+        )
+        result = {
+            "referencia": reference,
+            "estado": "Exito",
+            "nombre_pdf": file_name,
+            "embarque": entry.shipment,
+            "numeroFormulario": entry.form_number,
+            "year": entry.year,
+            "fechaAceptacion": entry.accepted_date or None,
+            "outputFolder": f"/{output_folder}",
+            "downloadFiles": [{
+                "driveItemId": str(metadata["id"]),
+                "driveBase": stable_drive_base,
+                "name": file_name,
+            }],
+            "extraidoDeConsolidado": located.extracted_from_consolidated,
+            "diagnostico": diagnostics,
+        }
+        if invoice:
+            result["factura"] = invoice
+            result["referenciasFactura"] = invoice_references or [reference]
+        return result
+    except PermanentProcessingError as exc:
+        logger.error("DIM: redacción rechazada por una verificación permanente")
+        return {
+            "referencia": reference, "estado": "Error", "detalle": str(exc),
+            "diagnostico": diagnostics, "_permanentError": True,
+        }
+    except Exception as exc:
+        logger.exception("DIM: fallo procesando una referencia")
+        return {"referencia": reference, "estado": "Error", "detalle": str(exc), "diagnostico": diagnostics}
+
+
 def process_hierarchical_references(references: list[str], supplied_terms: list[str], settings: Settings) -> dict[str, list[dict[str, Any]]]:
     if not references or any(not isinstance(value, str) or not value.strip() for value in references):
         raise ValueError("references must be a non-empty array of strings")
@@ -850,78 +959,15 @@ def process_hierarchical_references(references: list[str], supplied_terms: list[
         raise ValueError("datosSensibles must be an array of strings")
     graph = GraphClient(settings)
     index = _master_index(graph, settings)
-    # The target casillas are always redacted. Only request-specific terms are
-    # supplemental; generic defaults such as "nit" must not mask field labels.
-    terms = [value.strip() for value in supplied_terms if value.strip()]
     results: list[dict[str, Any]] = []
     for raw_reference in references:
-        reference, diagnostics = raw_reference.strip(), ["Excel maestro descargado"]
+        reference = raw_reference.strip()
         entry = index.get(_plain(reference))
         if not entry:
             logger.info("DIM: referencia no encontrada en Excel")
-            results.append({"referencia": reference, "estado": "Pendiente (No encontrado)", "diagnostico": diagnostics})
+            results.append({"referencia": reference, "estado": "Pendiente (No encontrado)", "diagnostico": ["Excel maestro revisado en todos los años configurados"]})
             continue
-        diagnostics.append(f"Referencia encontrada en hoja {entry.year}")
-        try:
-            located: LocatedPdf | None = None
-            for lookup_attempt in range(2):
-                try:
-                    located = _download_hierarchical_pdf(graph, entry, settings, diagnostics)
-                    break
-                except RuntimeError:
-                    # Folder listing/search code deliberately tolerates an
-                    # individual inaccessible location. If all candidates miss
-                    # after Graph reported a transient failure, repeat the
-                    # hierarchy once within this request instead of asking the
-                    # Wix user to click Search a second time.
-                    if lookup_attempt > 0 or not graph.had_transient_failure:
-                        raise
-                    graph.had_transient_failure = False
-                    diagnostics.append("Se reintentó la búsqueda por una respuesta temporal de SharePoint")
-                    logger.warning("DIM: repitiendo búsqueda tras un fallo temporal de Graph")
-            if located is None:
-                raise RuntimeError("No fue posible resolver el archivo de la declaración")
-            sanitized = redact_pdf(located.content, terms)
-            file_name = _form_pdf_name(entry.form_number, located.file_name, located.content)
-            source_folder = located.parent_folder
-            if source_folder.endswith("/Procesados"):
-                source_folder = source_folder.rsplit("/", 1)[0]
-            output_folder = f"{source_folder}/Enviados"
-            metadata = graph.upload_pdf(f"{output_folder}/{file_name}", sanitized, located.drive_base)
-            diagnostics.append("Redacción física aplicada y archivo subido")
-            if not metadata.get("id"):
-                raise RuntimeError("Microsoft Graph guardó el PDF sin devolver su identificador")
-            drive_reference = metadata.get("parentReference", {}).get("driveId")
-            stable_drive_base = (
-                f"{graph.base}/drives/{drive_reference}" if drive_reference else located.drive_base
-            )
-            results.append({
-                "referencia": reference,
-                "estado": "Exito",
-                "nombre_pdf": file_name,
-                "embarque": entry.shipment,
-                "numeroFormulario": entry.form_number,
-                "outputFolder": f"/{output_folder}",
-                "downloadFiles": [{
-                    "driveItemId": str(metadata["id"]),
-                    "driveBase": stable_drive_base,
-                    "name": file_name,
-                }],
-                "extraidoDeConsolidado": located.extracted_from_consolidated,
-                "diagnostico": diagnostics,
-            })
-        except PermanentProcessingError as exc:
-            logger.error("DIM: redacción rechazada por una verificación permanente")
-            results.append({
-                "referencia": reference,
-                "estado": "Error",
-                "detalle": str(exc),
-                "diagnostico": diagnostics,
-                "_permanentError": True,
-            })
-        except Exception as exc:
-            logger.exception("DIM: fallo procesando una referencia")
-            results.append({"referencia": reference, "estado": "Error", "detalle": str(exc), "diagnostico": diagnostics})
+        results.append(process_dim_entry(reference, entry, supplied_terms, settings, graph=graph))
     return {"resultados": results}
 
 

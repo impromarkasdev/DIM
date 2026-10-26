@@ -92,53 +92,28 @@ class ExtremePdfTests(unittest.TestCase):
 
 
 class ExtremeInvoiceTests(unittest.TestCase):
-    class _Cell:
-        def __init__(self, value):
-            self.v = value
-
-    class _Sheet:
-        def __init__(self, invoice, count):
-            self.invoice = invoice
-            self.count = count
-
-        def __enter__(self):
-            return self
-
-        def __exit__(self, *_args):
-            return False
-
-        def rows(self, sparse=True):
-            for index in range(self.count):
-                row = [None] * 11
-                row[2] = ExtremeInvoiceTests._Cell(self.invoice)
-                row[10] = ExtremeInvoiceTests._Cell(f"REF-{index:04d}")
-                yield row
-
-    class _Workbook:
-        sheets = ["BD"]
-
-        def __init__(self, count):
-            self.sheet = ExtremeInvoiceTests._Sheet("INV-EXTREME", count)
-
-        def __enter__(self):
-            return self
-
-        def __exit__(self, *_args):
-            return False
-
-        def get_sheet(self, _name):
-            return self.sheet
-
     def test_invoice_reference_reader_accepts_1000_and_rejects_1001(self) -> None:
         from app.invoice import MAX_INVOICE_REFERENCES, _read_sales_references
+        import pandas as pd
 
         self.assertEqual(MAX_INVOICE_REFERENCES, 1000)
-        with patch("pyxlsb.open_workbook", return_value=self._Workbook(1000)):
+        workbook = MagicMock()
+        workbook.__enter__.return_value = workbook
+        workbook.sheet_names = ["BD"]
+
+        def frame_with_count(count):
+            return pd.DataFrame([
+                ("INV-EXTREME", f"REF-{index:04d}") for index in range(count)
+            ])
+
+        with patch("app.invoice.pd.ExcelFile", return_value=workbook), \
+             patch("app.invoice.pd.read_excel", return_value=frame_with_count(1000)):
             references = _read_sales_references(b"fixture", "INV-EXTREME")
         self.assertEqual(len(references), 1000)
         self.assertEqual(len(set(references)), 1000)
 
-        with patch("pyxlsb.open_workbook", return_value=self._Workbook(1001)):
+        with patch("app.invoice.pd.ExcelFile", return_value=workbook), \
+             patch("app.invoice.pd.read_excel", return_value=frame_with_count(1001)):
             with self.assertRaisesRegex(ValueError, "1000"):
                 _read_sales_references(b"fixture", "INV-EXTREME")
 

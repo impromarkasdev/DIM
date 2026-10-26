@@ -1,10 +1,12 @@
 from __future__ import annotations
 
-import io
 import logging
 import re
 from collections import OrderedDict
+from io import BytesIO
 from typing import Any
+
+import pandas as pd
 
 from app.config import Settings
 from app.graph import GraphClient
@@ -28,35 +30,41 @@ def _declaration_key(value: str) -> str:
     return _plain(str(value))
 
 
-def _cell_value(row: tuple[Any, ...], index: int) -> Any:
-    return row[index].v if index < len(row) and row[index] is not None else None
-
-
 def _read_sales_references(workbook_bytes: bytes, invoice_number: str) -> list[str]:
-    """Scan only configured columns C (invoice) and K (reference) in XLSB."""
+    """Read XLSB columns C and K in memory without pyxlsb temp-file expansion."""
     try:
-        from pyxlsb import open_workbook
-
         target = _invoice_key(invoice_number)
         if not target:
             raise ValueError("Ingresa un número de factura válido.")
         references: OrderedDict[str, str] = OrderedDict()
-        with open_workbook(io.BytesIO(workbook_bytes)) as workbook:
-            sheet_name = "BD" if "BD" in workbook.sheets else workbook.sheets[0]
-            with workbook.get_sheet(sheet_name) as sheet:
-                for row_number, row in enumerate(sheet.rows(sparse=True), start=1):
-                    invoice = _cell_value(row, 2)
-                    reference = _cell_value(row, 10)
-                    if row_number == 1 and str(invoice or "").strip().casefold() in {"factura", "invoice"}:
-                        continue
-                    if _invoice_key(invoice) != target:
-                        continue
-                    reference_text = str(reference or "").strip()
-                    if reference_text.endswith(".0") and reference_text[:-2].isdigit():
-                        reference_text = reference_text[:-2]
-                    key = _plain(reference_text)
-                    if key:
-                        references.setdefault(key, reference_text)
+        # pyxlsb materializes decompressed workbook parts in TemporaryFile.
+        # Vercel functions have a 500 MB /tmp ceiling, which this 41 MB XLSB
+        # can exceed. Calamine reads the in-memory buffer and only returns C/K.
+        with pd.ExcelFile(BytesIO(workbook_bytes), engine="calamine") as workbook:
+            sheet_name = "BD" if "BD" in workbook.sheet_names else workbook.sheet_names[0]
+            frame = pd.read_excel(
+                workbook,
+                sheet_name=sheet_name,
+                engine="calamine",
+                usecols=[2, 10],
+                header=None,
+                dtype=object,
+            )
+        for row_number, (invoice, reference) in enumerate(
+            frame.itertuples(index=False, name=None), start=1
+        ):
+            if pd.isna(invoice) or pd.isna(reference):
+                continue
+            if row_number == 1 and str(invoice or "").strip().casefold() in {"factura", "invoice"}:
+                continue
+            if _invoice_key(invoice) != target:
+                continue
+            reference_text = str(reference or "").strip()
+            if reference_text.endswith(".0") and reference_text[:-2].isdigit():
+                reference_text = reference_text[:-2]
+            key = _plain(reference_text)
+            if key:
+                references.setdefault(key, reference_text)
         logger.info("Invoice workbook scan finished: matched %s distinct references", len(references))
         if len(references) > MAX_INVOICE_REFERENCES:
             raise ValueError(f"La factura supera el máximo operativo de {MAX_INVOICE_REFERENCES} referencias únicas.")
